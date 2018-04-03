@@ -1,5 +1,9 @@
 *.swp
-.*
+.DS_Store
+.grin*
+node*
 target
 Cargo.lock
-**.iml
+*.iml
+grin.log
+wallet.seed

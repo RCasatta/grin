@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,21 +13,16 @@
 // limitations under the License.
 
 use std::convert::From;
+use std::fs::File;
 use std::io;
-use std::net::{SocketAddr, IpAddr};
-use std::sync::Arc;
-
-use futures::Future;
-use tokio_core::net::TcpStream;
-use tokio_timer::TimerError;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::mpsc;
 
 use core::core;
 use core::core::hash::Hash;
 use core::core::target::Difficulty;
 use core::ser;
-
-/// Maximum number of hashes in a block header locator request
-pub const MAX_LOCATORS: u32 = 10;
+use grin_store;
 
 /// Maximum number of block headers a peer should ever send
 pub const MAX_BLOCK_HEADERS: u32 = 512;
@@ -39,12 +34,38 @@ pub const MAX_BLOCK_BODIES: u32 = 16;
 /// Maximum number of peer addresses a peer should ever send
 pub const MAX_PEER_ADDRS: u32 = 256;
 
+/// Dandelion relay time
+const DANDELION_RELAY_TIME: i64 = 600;
+
+/// How long a banned peer should be banned for
+const BAN_WINDOW: i64 = 10800;
+
+/// The max peer count
+const PEER_MAX_COUNT: u32 = 25;
+
+/// min preferred peer count
+const PEER_MIN_PREFERRED_COUNT: u32 = 8;
+
 #[derive(Debug)]
 pub enum Error {
 	Serialization(ser::Error),
 	Connection(io::Error),
+	/// Header type does not match the expected message type
+	BadMessage,
+	Banned,
 	ConnectionClose,
 	Timeout,
+	Store(grin_store::Error),
+	PeerWithSelf,
+	ProtocolMismatch {
+		us: u32,
+		peer: u32,
+	},
+	GenesisMismatch {
+		us: Hash,
+		peer: Hash,
+	},
+	Send(String),
 }
 
 impl From<ser::Error> for Error {
@@ -52,31 +73,95 @@ impl From<ser::Error> for Error {
 		Error::Serialization(e)
 	}
 }
+impl From<grin_store::Error> for Error {
+	fn from(e: grin_store::Error) -> Error {
+		Error::Store(e)
+	}
+}
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
 		Error::Connection(e)
 	}
 }
-impl From<TimerError> for Error {
-	fn from(_: TimerError) -> Error {
-		Error::Timeout
+impl<T> From<mpsc::TrySendError<T>> for Error {
+	fn from(e: mpsc::TrySendError<T>) -> Error {
+		Error::Send(e.to_string())
 	}
 }
+// impl From<TimerError> for Error {
+// 	fn from(_: TimerError) -> Error {
+// 		Error::Timeout
+// 	}
+// }
 
 /// Configuration for the peer-to-peer server.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P2PConfig {
 	pub host: IpAddr,
 	pub port: u16,
+
+	pub peers_allow: Option<Vec<String>>,
+
+	pub peers_deny: Option<Vec<String>>,
+
+	pub dandelion_relay_time: Option<i64>,
+
+	pub ban_window: Option<i64>,
+
+	pub peer_max_count: Option<u32>,
+
+	pub peer_min_preferred_count: Option<u32>,
 }
 
 /// Default address for peer-to-peer connections.
 impl Default for P2PConfig {
 	fn default() -> P2PConfig {
-		let ipaddr = "127.0.0.1".parse().unwrap();
+		let ipaddr = "0.0.0.0".parse().unwrap();
 		P2PConfig {
 			host: ipaddr,
 			port: 13414,
+			peers_allow: None,
+			peers_deny: None,
+			dandelion_relay_time: Some(DANDELION_RELAY_TIME),
+			ban_window: Some(BAN_WINDOW),
+			peer_max_count: Some(PEER_MAX_COUNT),
+			peer_min_preferred_count: Some(PEER_MIN_PREFERRED_COUNT),
+		}
+	}
+}
+
+/// Note certain fields are options just so they don't have to be
+/// included in grin.toml, but we don't want them to ever return none
+impl P2PConfig {
+	/// return dandelion_relay_time
+	pub fn dandelion_relay_time(&self) -> i64 {
+		match self.dandelion_relay_time {
+			Some(n) => n,
+			None => DANDELION_RELAY_TIME,
+		}
+	}
+
+	/// return ban window
+	pub fn ban_window(&self) -> i64 {
+		match self.ban_window {
+			Some(n) => n,
+			None => BAN_WINDOW,
+		}
+	}
+
+	/// return peer_max_count
+	pub fn peer_max_count(&self) -> u32 {
+		match self.peer_max_count {
+			Some(n) => n,
+			None => PEER_MAX_COUNT,
+		}
+	}
+
+	/// return peer_preferred_count
+	pub fn peer_min_preferred_count(&self) -> u32 {
+		match self.peer_min_preferred_count {
+			Some(n) => n,
+			None => PEER_MIN_PREFERRED_COUNT,
 		}
 	}
 }
@@ -84,86 +169,82 @@ impl Default for P2PConfig {
 bitflags! {
   /// Options for what type of interaction a peer supports
   #[derive(Serialize, Deserialize)]
-  pub flags Capabilities: u32 {
-    /// We don't know (yet) what the peer can do.
-    const UNKNOWN = 0b00000000,
-    /// Full archival node, has the whole history without any pruning.
-    const FULL_HIST = 0b00000001,
-    /// Can provide block headers and the UTXO set for some recent-enough
-    /// height.
-    const UTXO_HIST = 0b00000010,
-    /// Can provide a list of healthy peers
-    const PEER_LIST = 0b00000100,
+  pub struct Capabilities: u32 {
+	/// We don't know (yet) what the peer can do.
+	const UNKNOWN = 0b00000000;
+	/// Full archival node, has the whole history without any pruning.
+	const FULL_HIST = 0b00000001;
+	/// Can provide block headers and the TxHashSet for some recent-enough
+	/// height.
+	const TXHASHSET_HIST = 0b00000010;
+	/// Can provide a list of healthy peers
+	const PEER_LIST = 0b00000100;
 
-    const FULL_NODE = FULL_HIST.bits | UTXO_HIST.bits | PEER_LIST.bits,
+	const FULL_NODE = Capabilities::FULL_HIST.bits
+		| Capabilities::TXHASHSET_HIST.bits
+		| Capabilities::PEER_LIST.bits;
   }
 }
 
+/// Types of connection
+enum_from_primitive! {
+	#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+	pub enum Direction {
+		Inbound,
+		Outbound,
+	}
+}
+
 /// General information about a connected peer that's useful to other modules.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerInfo {
 	pub capabilities: Capabilities,
 	pub user_agent: String,
 	pub version: u32,
 	pub addr: SocketAddr,
 	pub total_difficulty: Difficulty,
+	pub height: u64,
+	pub direction: Direction,
 }
 
-/// A given communication protocol agreed upon between 2 peers (usually
-/// ourselves and a remote) after handshake. This trait is necessary to allow
-/// protocol negotiation as it gets upgraded to multiple versions.
-pub trait Protocol {
-	/// Starts handling protocol communication, the connection) is expected to
-	/// be  known already, usually passed during construction. Will typically
-	/// block so needs to be called withing a coroutine. Should also be called
-	/// only once.
-	fn handle(&self,
-	          conn: TcpStream,
-	          na: Arc<NetAdapter>)
-	          -> Box<Future<Item = (), Error = Error>>;
-
-	/// Sends a ping message to the remote peer.
-	fn send_ping(&self) -> Result<(), Error>;
-
-	/// Relays a block to the remote peer.
-	fn send_block(&self, b: &core::Block) -> Result<(), Error>;
-
-	/// Relays a transaction to the remote peer.
-	fn send_transaction(&self, tx: &core::Transaction) -> Result<(), Error>;
-
-	/// Sends a request for block headers based on the provided block locator.
-	fn send_header_request(&self, locator: Vec<Hash>) -> Result<(), Error>;
-
-	/// Sends a request for a block from its hash.
-	fn send_block_request(&self, h: Hash) -> Result<(), Error>;
-
-	/// Sends a request for some peer addresses.
-	fn send_peer_request(&self, capab: Capabilities) -> Result<(), Error>;
-
-	/// How many bytes have been sent/received to/from the remote peer.
-	fn transmitted_bytes(&self) -> (u64, u64);
-
-	/// Close the connection to the remote peer.
-	fn close(&self);
+/// The full txhashset data along with indexes required for a consumer to
+/// rewind to a consistant requested state.
+pub struct TxHashSetRead {
+	/// Output tree index the receiver should rewind to
+	pub output_index: u64,
+	/// Kernel tree index the receiver should rewind to
+	pub kernel_index: u64,
+	/// Binary stream for the txhashset zipped data
+	pub reader: File,
 }
 
 /// Bridge between the networking layer and the rest of the system. Handles the
 /// forwarding or querying of blocks and transactions from the network among
 /// other things.
-pub trait NetAdapter: Sync + Send {
-	/// Current height of our chain.
+pub trait ChainAdapter: Sync + Send {
+	/// Current total difficulty on our chain
 	fn total_difficulty(&self) -> Difficulty;
 
-	/// A valid transaction has been received from one of our peers
-	fn transaction_received(&self, tx: core::Transaction);
+	/// Current total height
+	fn total_height(&self) -> u64;
 
-	/// A block has been received from one of our peers
-	fn block_received(&self, b: core::Block);
+	/// A valid transaction has been received from one of our peers
+	fn transaction_received(&self, tx: core::Transaction, stem: bool);
+
+	/// A block has been received from one of our peers. Returns true if the
+	/// block could be handled properly and is not deemed defective by the
+	/// chain. Returning false means the block will never be valid and
+	/// may result in the peer being banned.
+	fn block_received(&self, b: core::Block, addr: SocketAddr) -> bool;
+
+	fn compact_block_received(&self, cb: core::CompactBlock, addr: SocketAddr) -> bool;
+
+	fn header_received(&self, bh: core::BlockHeader, addr: SocketAddr) -> bool;
 
 	/// A set of block header has been received, typically in response to a
 	/// block
 	/// header request.
-	fn headers_received(&self, bh: Vec<core::BlockHeader>);
+	fn headers_received(&self, bh: Vec<core::BlockHeader>, addr: SocketAddr);
 
 	/// Finds a list of block headers based on the provided locator. Tries to
 	/// identify the common chain and gets the headers that follow it
@@ -173,6 +254,28 @@ pub trait NetAdapter: Sync + Send {
 	/// Gets a full block by its hash.
 	fn get_block(&self, h: Hash) -> Option<core::Block>;
 
+	/// Provides a reading view into the current txhashset state as well as
+	/// the required indexes for a consumer to rewind to a consistant state
+	/// at the provided block hash.
+	fn txhashset_read(&self, h: Hash) -> Option<TxHashSetRead>;
+
+	/// Writes a reading view on a txhashset state that's been provided to us.
+	/// If we're willing to accept that new state, the data stream will be
+	/// read as a zip file, unzipped and the resulting state files should be
+	/// rewound to the provided indexes.
+	fn txhashset_write(
+		&self,
+		h: Hash,
+		rewind_to_output: u64,
+		rewind_to_kernel: u64,
+		txhashset_data: File,
+		peer_addr: SocketAddr,
+	) -> bool;
+}
+
+/// Additional methods required by the protocol that don't need to be
+/// externally implemented.
+pub trait NetAdapter: ChainAdapter {
 	/// Find good peers we know with the provided capability and return their
 	/// addresses.
 	fn find_peer_addrs(&self, capab: Capabilities) -> Vec<SocketAddr>;
@@ -180,6 +283,9 @@ pub trait NetAdapter: Sync + Send {
 	/// A list of peers has been received from one of our peers.
 	fn peer_addrs_received(&self, Vec<SocketAddr>);
 
-	/// Network successfully connected to a peer.
-	fn peer_connected(&self, &PeerInfo);
+	/// Heard total_difficulty from a connected peer (via ping/pong).
+	fn peer_difficulty(&self, SocketAddr, Difficulty, u64);
+
+	/// Is this peer currently banned?
+	fn is_banned(&self, addr: SocketAddr) -> bool;
 }

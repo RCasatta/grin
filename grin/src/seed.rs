@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,250 +16,256 @@
 //! a mining worker implementation
 //!
 
-use rand::{thread_rng, Rng};
-use std::cmp::min;
+use std::io::Read;
 use std::net::SocketAddr;
-use std::str::{self, FromStr};
-use std::sync::Arc;
-use std::time;
+use std::str;
+use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::thread;
+use time::{self, now_utc};
 
-use cpupool;
-use futures::{self, future, Future, Stream};
-use futures::sync::mpsc;
 use hyper;
-use tokio_core::reactor;
-use tokio_timer::Timer;
 
 use p2p;
+use util::LOGGER;
 
-const PEER_MAX_COUNT: u32 = 25;
-const PEER_PREFERRED_COUNT: u32 = 8;
-const SEEDS_URL: &'static str = "http://www.mimwim.org/seeds.txt";
+const SEEDS_URL: &'static str = "http://grin-tech.org/seeds.txt";
 
-pub struct Seeder {
-	peer_store: Arc<p2p::PeerStore>,
-	p2p: Arc<p2p::Server>,
-
+pub fn connect_and_monitor(
+	p2p_server: Arc<p2p::Server>,
 	capabilities: p2p::Capabilities,
+	seed_list: Box<Fn() -> Vec<SocketAddr> + Send>,
+	stop: Arc<AtomicBool>,
+) {
+	let _ = thread::Builder::new()
+		.name("seed".to_string())
+		.spawn(move || {
+			let peers = p2p_server.peers.clone();
+
+			// open a channel with a listener that connects every peer address sent below
+			// max peer count
+			let (tx, rx) = mpsc::channel();
+
+			// check seeds first
+			connect_to_seeds(peers.clone(), tx.clone(), seed_list);
+
+			let mut prev = time::now_utc() - time::Duration::seconds(60);
+			loop {
+				let current_time = time::now_utc();
+
+				if current_time - prev > time::Duration::seconds(20) {
+					// try to connect to any address sent to the channel
+					listen_for_addrs(peers.clone(), p2p_server.clone(), capabilities, &rx);
+
+					// monitor additional peers if we need to add more
+					monitor_peers(
+						peers.clone(),
+						p2p_server.config.clone(),
+						capabilities,
+						tx.clone(),
+					);
+
+					update_dandelion_relay(peers.clone(), p2p_server.config.clone());
+
+					prev = current_time;
+				}
+
+				thread::sleep(Duration::from_secs(1));
+
+				if stop.load(Ordering::Relaxed) {
+					break;
+				}
+			}
+		});
 }
 
-impl Seeder {
-	pub fn new(capabilities: p2p::Capabilities,
-	           peer_store: Arc<p2p::PeerStore>,
-	           p2p: Arc<p2p::Server>)
-	           -> Seeder {
-		Seeder {
-			peer_store: peer_store,
-			p2p: p2p,
-			capabilities: capabilities,
+fn monitor_peers(
+	peers: Arc<p2p::Peers>,
+	config: p2p::P2PConfig,
+	capabilities: p2p::Capabilities,
+	tx: mpsc::Sender<SocketAddr>,
+) {
+	// regularly check if we need to acquire more peers  and if so, gets
+	// them from db
+	let total_count = peers.all_peers().len();
+	let mut healthy_count = 0;
+	let mut banned_count = 0;
+	let mut defunct_count = 0;
+	for x in peers.all_peers() {
+		match x.flags {
+			p2p::State::Banned => {
+				let interval = now_utc().to_timespec().sec - x.last_banned;
+				// Unban peer
+				if interval >= config.ban_window() {
+					peers.unban_peer(&x.addr);
+					debug!(
+						LOGGER,
+						"monitor_peers: unbanned {} after {} seconds", x.addr, interval
+					);
+				} else {
+					banned_count += 1;
+				}
+			}
+			p2p::State::Healthy => healthy_count += 1,
+			p2p::State::Defunct => defunct_count += 1,
 		}
 	}
 
-	pub fn connect_and_monitor(&self,
-	                           h: reactor::Handle,
-	                           seed_list: Box<Future<Item = Vec<SocketAddr>, Error = String>>) {
-		// open a channel with a listener that connects every peer address sent below
-		// max peer count
-		let (tx, rx) = futures::sync::mpsc::unbounded();
-		h.spawn(self.listen_for_addrs(h.clone(), rx));
+	debug!(
+		LOGGER,
+		"monitor_peers: {} connected ({} most_work). \
+		 all {} = {} healthy + {} banned + {} defunct",
+		peers.connected_peers().len(),
+		peers.most_work_peers().len(),
+		total_count,
+		healthy_count,
+		banned_count,
+		defunct_count,
+	);
 
-		// check seeds and start monitoring connections
-		let seeder = self.connect_to_seeds(tx.clone(), seed_list)
-			.join(self.monitor_peers(tx.clone()));
+	// maintenance step first, clean up p2p server peers
+	peers.clean_peers(config.peer_max_count() as usize);
 
-		h.spawn(seeder.map(|_| ()).map_err(|e| {
-			error!("Seeding or peer monitoring error: {}", e);
-			()
-		}));
+	// not enough peers, getting more from db
+	if peers.peer_count() >= config.peer_min_preferred_count() {
+		return;
 	}
 
-	fn monitor_peers(&self,
-	                 tx: mpsc::UnboundedSender<SocketAddr>)
-	                 -> Box<Future<Item = (), Error = String>> {
-		let peer_store = self.peer_store.clone();
-		let p2p_server = self.p2p.clone();
-
-		// now spawn a new future to regularly check if we need to acquire more peers
-		// and if so, gets them from db
-		let mon_loop = Timer::default()
-			.interval(time::Duration::from_secs(10))
-			.for_each(move |_| {
-
-				// maintenance step first, clean up p2p server peers and mark bans
-				// if needed
-				let disconnected = p2p_server.clean_peers();
-				for p in disconnected {
-					if p.is_banned() {
-						debug!("Marking peer {} as banned.", p.info.addr);
-						let update_result = peer_store.update_state(
-							p.info.addr, p2p::State::Banned);
-						match update_result {
-							Ok(()) => {}
-							Err(_) => {}
-						}
-					}
-				}
-
-				// we don't have enough peers, getting more from db
-				if p2p_server.peer_count() < PEER_PREFERRED_COUNT {
-					let mut peers = peer_store.find_peers(p2p::State::Healthy,
-					                                      p2p::UNKNOWN,
-					                                      (2 * PEER_MAX_COUNT) as usize);
-					peers.retain(|p| !p2p_server.is_known(p.addr));
-					if peers.len() > 0 {
-						debug!("Got {} more peers from db, trying to connect.", peers.len());
-						thread_rng().shuffle(&mut peers[..]);
-						let sz = min(PEER_PREFERRED_COUNT as usize, peers.len());
-						for p in &peers[0..sz] {
-							tx.send(p.addr).unwrap();
-						}
-					}
-				}
-				Ok(())
-			})
-			.map_err(|e| e.to_string());
-
-		Box::new(mon_loop)
+	// loop over connected peers
+	// ask them for their list of peers
+	for p in peers.connected_peers() {
+		if let Ok(p) = p.try_read() {
+			debug!(LOGGER, "monitor_peers: ask {} for more peers", p.info.addr);
+			let _ = p.send_peer_request(capabilities);
+		} else {
+			warn!(LOGGER, "monitor_peers: failed to get read lock on peer");
+		}
 	}
 
-	// Check if we have any pre-existing peer in db. If so, start with those,
-	// otherwise use the seeds provided.
-	fn connect_to_seeds(&self,
-	                    tx: mpsc::UnboundedSender<SocketAddr>,
-	                    seed_list: Box<Future<Item = Vec<SocketAddr>, Error = String>>)
-	                    -> Box<Future<Item = (), Error = String>> {
-		let peer_store = self.peer_store.clone();
-
-		// a thread pool is required so we don't block the event loop with a
-		// db query
-		let thread_pool = cpupool::CpuPool::new(1);
-		let seeder = thread_pool.spawn_fn(move || {
-				// check if we have some peers in db
-				let peers = peer_store.find_peers(p2p::State::Healthy,
-				                                  p2p::FULL_HIST,
-				                                  (2 * PEER_MAX_COUNT) as usize);
-				Ok(peers)
-			})
-			.and_then(|mut peers| {
-				// if so, get their addresses, otherwise use our seeds
-				if peers.len() > 0 {
-					thread_rng().shuffle(&mut peers[..]);
-					Box::new(future::ok(peers.iter().map(|p| p.addr).collect::<Vec<_>>()))
-				} else {
-					seed_list
-				}
-			})
-			.and_then(move |peer_addrs| {
-				// connect to this first set of addresses
-				let sz = min(PEER_PREFERRED_COUNT as usize, peer_addrs.len());
-				for addr in &peer_addrs[0..sz] {
-					debug!("Connecting to seed: {}.", addr);
-					tx.send(*addr).unwrap();
-				}
-				if peer_addrs.len() == 0 {
-					warn!("No seeds were retrieved.");
-				}
-				Ok(())
-			});
-		Box::new(seeder)
+	// find some peers from our db
+	// and queue them up for a connection attempt
+	let peers = peers.find_peers(p2p::State::Healthy, p2p::Capabilities::UNKNOWN, 100);
+	for p in peers {
+		debug!(LOGGER, "monitor_peers: queue to soon try {}", p.addr);
+		tx.send(p.addr).unwrap();
 	}
+}
 
-	/// Builds a future to continuously listen on a channel receiver for new
-	/// addresses to and initiate a connection if the max peer count isn't
-	/// exceeded. A request for more peers is also automatically sent after
-	/// connection.
-	fn listen_for_addrs(&self,
-	                    h: reactor::Handle,
-	                    rx: mpsc::UnboundedReceiver<SocketAddr>)
-	                    -> Box<Future<Item = (), Error = ()>> {
-		let capab = self.capabilities;
-		let p2p_store = self.peer_store.clone();
-		let p2p_server = self.p2p.clone();
-
-		let listener = rx.for_each(move |peer_addr| {
-			debug!("New peer address to connect to: {}.", peer_addr);
-			let inner_h = h.clone();
-			if p2p_server.peer_count() < PEER_MAX_COUNT {
-				connect_and_req(capab,
-				                p2p_store.clone(),
-				                p2p_server.clone(),
-				                inner_h,
-				                peer_addr)
-			} else {
-				Box::new(future::ok(()))
+fn update_dandelion_relay(peers: Arc<p2p::Peers>, config: p2p::P2PConfig) {
+	// Dandelion Relay Updater
+	let dandelion_relay = peers.get_dandelion_relay();
+	if dandelion_relay.is_empty() {
+		debug!(LOGGER, "monitor_peers: no dandelion relay updating");
+		peers.update_dandelion_relay();
+	} else {
+		for last_added in dandelion_relay.keys() {
+			let dandelion_interval = now_utc().to_timespec().sec - last_added;
+			if dandelion_interval >= config.dandelion_relay_time() {
+				debug!(LOGGER, "monitor_peers: updating expired dandelion relay");
+				peers.update_dandelion_relay();
 			}
-		});
-		Box::new(listener)
+		}
+	}
+}
+
+// Check if we have any pre-existing peer in db. If so, start with those,
+// otherwise use the seeds provided.
+fn connect_to_seeds(
+	peers: Arc<p2p::Peers>,
+	tx: mpsc::Sender<SocketAddr>,
+	seed_list: Box<Fn() -> Vec<SocketAddr>>,
+) {
+	// check if we have some peers in db
+	let peers = peers.find_peers(p2p::State::Healthy, p2p::Capabilities::FULL_HIST, 100);
+
+	// if so, get their addresses, otherwise use our seeds
+	let peer_addrs = if peers.len() > 3 {
+		peers.iter().map(|p| p.addr).collect::<Vec<_>>()
+	} else {
+		seed_list()
+	};
+
+	if peer_addrs.len() == 0 {
+		warn!(LOGGER, "No seeds were retrieved.");
+	}
+
+	// connect to this first set of addresses
+	for addr in peer_addrs {
+		tx.send(addr).unwrap();
+	}
+}
+
+/// Regularly poll a channel receiver for new addresses and initiate a
+/// connection if the max peer count isn't exceeded. A request for more
+/// peers is also automatically sent after connection.
+fn listen_for_addrs(
+	peers: Arc<p2p::Peers>,
+	p2p: Arc<p2p::Server>,
+	capab: p2p::Capabilities,
+	rx: &mpsc::Receiver<SocketAddr>,
+) {
+	let pc = peers.peer_count();
+	for addr in rx.try_iter() {
+		if pc < p2p.config.peer_max_count() {
+			let peers_c = peers.clone();
+			let p2p_c = p2p.clone();
+			let _ = thread::Builder::new()
+				.name("peer_connect".to_string())
+				.spawn(move || {
+					let connect_peer = p2p_c.connect(&addr);
+					match connect_peer {
+						Ok(p) => {
+							trace!(LOGGER, "connect_and_req: ok. attempting send_peer_request");
+							if let Ok(p) = p.try_read() {
+								let _ = p.send_peer_request(capab);
+							}
+						}
+						Err(e) => {
+							debug!(LOGGER, "connect_and_req: {} is Defunct; {:?}", addr, e);
+							let _ = peers_c.update_state(addr, p2p::State::Defunct);
+						}
+					}
+				});
+		}
 	}
 }
 
 /// Extract the list of seeds from a pre-defined text file available through
 /// http. Easy method until we have a set of DNS names we can rely on.
-pub fn web_seeds(h: reactor::Handle) -> Box<Future<Item = Vec<SocketAddr>, Error = String>> {
-	let url = hyper::Uri::from_str(&SEEDS_URL).unwrap();
-	let seeds = future::ok(()).and_then(move |_| {
-		let client = hyper::Client::new(&h);
+pub fn web_seeds() -> Box<Fn() -> Vec<SocketAddr> + Send> {
+	Box::new(|| {
+		let client = hyper::Client::new();
+		debug!(LOGGER, "Retrieving seed nodes from {}", &SEEDS_URL);
 
 		// http get, filtering out non 200 results
-		client.get(url)
-			.map_err(|e| e.to_string())
-			.and_then(|res| {
-				if res.status() != hyper::Ok {
-					return Err(format!("Gist request failed: {}", res.status()));
-				}
-				Ok(res)
-			})
-			.and_then(|res| {
-				// collect all chunks and split around whitespace to get a list of SocketAddr
-				res.body().collect().map_err(|e| e.to_string()).and_then(|chunks| {
-					let res = chunks.iter().fold("".to_string(), |acc, ref chunk| {
-						acc + str::from_utf8(&chunk[..]).unwrap()
-					});
-					let addrs =
-						res.split_whitespace().map(|s| s.parse().unwrap()).collect::<Vec<_>>();
-					Ok(addrs)
-				})
-			})
-	});
-	Box::new(seeds)
+		let mut res = client
+			.get(SEEDS_URL)
+			.send()
+			.expect("Failed to resolve seeds.");
+		if res.status != hyper::Ok {
+			panic!("Failed to resolve seeds, got status {}.", res.status);
+		}
+		let mut buf = vec![];
+		res.read_to_end(&mut buf)
+			.expect("Could not read seed list.");
+
+		let text = str::from_utf8(&buf[..]).expect("Corrupted seed list.");
+		let addrs = text.split_whitespace()
+			.map(|s| s.parse().unwrap())
+			.collect::<Vec<_>>();
+		debug!(LOGGER, "Retrieved seed addresses: {:?}", addrs);
+		addrs
+	})
 }
 
 /// Convenience function when the seed list is immediately known. Mostly used
 /// for tests.
-pub fn predefined_seeds(addrs_str: Vec<String>)
-                        -> Box<Future<Item = Vec<SocketAddr>, Error = String>> {
-	let seeds = future::ok(())
-		.and_then(move |_| Ok(addrs_str.iter().map(|s| s.parse().unwrap()).collect::<Vec<_>>()));
-	Box::new(seeds)
-}
-
-fn connect_and_req(capab: p2p::Capabilities,
-                   peer_store: Arc<p2p::PeerStore>,
-                   p2p: Arc<p2p::Server>,
-                   h: reactor::Handle,
-                   addr: SocketAddr)
-                   -> Box<Future<Item = (), Error = ()>> {
-	let fut = p2p.connect_peer(addr, h)
-		.then(move |p| {
-			match p {
-				Ok(Some(p)) => {
-					let peer_result = p.send_peer_request(capab);
-					match peer_result {
-						Ok(()) => {}
-						Err(_) => {}
-					}
-				}
-				Err(e) => {
-					error!("Peer request error: {:?}", e);
-					let update_result = peer_store.update_state(addr, p2p::State::Defunct);
-					match update_result {
-						Ok(()) => {}
-						Err(_) => {}
-					}
-				}
-				_ => {}
-			}
-			Ok(())
-		});
-	Box::new(fut)
+pub fn predefined_seeds(addrs_str: Vec<String>) -> Box<Fn() -> Vec<SocketAddr> + Send> {
+	Box::new(move || {
+		addrs_str
+			.iter()
+			.map(|s| s.parse().unwrap())
+			.collect::<Vec<_>>()
+	})
 }

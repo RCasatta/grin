@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,203 +15,488 @@
 //! Provides the JSON/HTTP API for wallets to receive payments. Because
 //! receiving money in MimbleWimble requires an interactive exchange, a
 //! wallet server that's running at all time is required in many cases.
-//!
-//! The API looks like this:
-//!
-//! POST /v1/wallet/receive
-//! > {
-//! >   "amount": 10,
-//! >   "blind_sum": "a12b7f...",
-//! >   "tx": "f083de...",
-//! > }
-//!
-//! < {
-//! <   "tx": "f083de...",
-//! <   "status": "ok"
-//! < }
-//!
-//! POST /v1/wallet/finalize
-//! > {
-//! >   "tx": "f083de...",
-//! > }
-//!
-//! POST /v1/wallet/receive_coinbase
-//! > {
-//! >   "amount": 1,
-//! > }
-//!
-//! < {
-//! <   "output": "8a90bc...",
-//! <   "kernel": "f083de...",
-//! < }
-//!
-//! Note that while at this point the finalize call is completely unecessary, a
-//! double-exchange will be required as soon as we support Schnorr signatures.
-//! So we may as well have it in place already.
 
-use std::convert::From;
-use secp::{self};
-use secp::key::SecretKey;
+use bodyparser;
+use iron::prelude::*;
+use iron::Handler;
+use iron::status;
+use serde_json;
+use uuid::Uuid;
 
-use core::core::{Block, Transaction, TxKernel, Output, build};
-use core::ser;
-use api::{self, ApiEndpoint, Operation, ApiResult};
-use extkey::ExtendedKey;
+use api;
+use core::consensus::reward;
+use core::core::{amount_to_hr_string, build, Block, Committed, Output, Transaction, TxKernel};
+use core::{global, ser};
+use keychain::{BlindingFactor, Identifier, Keychain};
 use types::*;
-use util;
+use util::{secp, to_hex, LOGGER};
+use urlencoded::UrlEncodedQuery;
+use failure::ResultExt;
 
 /// Dummy wrapper for the hex-encoded serialized transaction.
 #[derive(Serialize, Deserialize)]
-struct TxWrapper {
-	tx_hex: String,
+pub struct TxWrapper {
+	pub tx_hex: String,
 }
 
-/// Receive an already well formed JSON transaction issuance and finalize the
-/// transaction, adding our receiving output, to broadcast to the rest of the
-/// network.
-pub fn receive_json_tx(config: &WalletConfig, ext_key: &ExtendedKey, partial_tx_str: &str) -> Result<(), Error> {
+/// Receive Part 1 of interactive transactions from sender, Sender Initiation
+/// Return result of part 2, Recipient Initation, to sender
+/// -Receiver receives inputs, outputs xS * G and kS * G
+/// -Receiver picks random blinding factors for all outputs being received, computes total blinding
+///     excess xR
+/// -Receiver picks random nonce kR
+/// -Receiver computes Schnorr challenge e = H(M | kR * G + kS * G)
+/// -Receiver computes their part of signature, sR = kR + e * xR
+/// -Receiver responds with sR, blinding excess xR * G, public nonce kR * G
 
-	let (amount, blinding, partial_tx) = partial_tx_from_json(partial_tx_str)?;
-	let final_tx = receive_transaction(&config, ext_key, amount, blinding, partial_tx)?;
-	let tx_hex = util::to_hex(ser::ser_vec(&final_tx).unwrap());
+fn handle_sender_initiation(
+	config: &WalletConfig,
+	keychain: &Keychain,
+	partial_tx: &PartialTx,
+) -> Result<PartialTx, Error> {
+	let (amount, _sender_pub_blinding, sender_pub_nonce, kernel_offset, _sig, tx) =
+		read_partial_tx(keychain, partial_tx)?;
 
-	let url = format!("{}/v1/pool/push", config.check_node_api_http_addr.as_str());
-	let _: TxWrapper = api::client::post(url.as_str(), &TxWrapper { tx_hex: tx_hex })?;
-	Ok(())
+	let root_key_id = keychain.root_key_id();
+
+	// double check the fee amount included in the partial tx
+	// we don't necessarily want to just trust the sender
+	// we could just overwrite the fee here (but we won't) due to the ecdsa sig
+	let fee = tx_fee(tx.inputs.len(), tx.outputs.len() + 1, None);
+	if fee != tx.fee() {
+		return Err(ErrorKind::FeeDispute {
+			sender_fee: tx.fee(),
+			recipient_fee: fee,
+		})?;
+	}
+
+	if fee > amount {
+		info!(
+			LOGGER,
+			"Rejected the transfer because transaction fee ({}) exceeds received amount ({}).",
+			amount_to_hr_string(fee),
+			amount_to_hr_string(amount)
+		);
+		return Err(ErrorKind::FeeExceedsAmount {
+			sender_amount: amount,
+			recipient_fee: fee,
+		})?;
+	}
+
+	let out_amount = amount - fee;
+
+	// First step is just to get the excess sum of the outputs we're participating
+	// in Output and key needs to be stored until transaction finalisation time,
+	// somehow
+
+	let key_id = WalletData::with_wallet(&config.data_file_dir, |wallet_data| {
+		let (key_id, derivation) = next_available_key(&wallet_data, keychain);
+
+		wallet_data.add_output(OutputData {
+			root_key_id: root_key_id.clone(),
+			key_id: key_id.clone(),
+			n_child: derivation,
+			value: out_amount,
+			status: OutputStatus::Unconfirmed,
+			height: 0,
+			lock_height: 0,
+			is_coinbase: false,
+			block: None,
+			merkle_proof: None,
+		});
+
+		key_id
+	})?;
+
+	// Still handy for getting the blinding sum
+	let (_, blind_sum) =
+		build::partial_transaction(vec![build::output(out_amount, key_id.clone())], keychain)
+			.context(ErrorKind::Keychain)?;
+
+	warn!(LOGGER, "Creating new aggsig context");
+	// Create a new aggsig context
+	// this will create a new blinding sum and nonce, and store them
+	let blind = blind_sum
+		.secret_key(&keychain.secp())
+		.context(ErrorKind::Keychain)?;
+	keychain
+		.aggsig_create_context(&partial_tx.id, blind)
+		.context(ErrorKind::Keychain)?;
+	keychain.aggsig_add_output(&partial_tx.id, &key_id);
+
+	let sig_part = keychain
+		.aggsig_calculate_partial_sig(&partial_tx.id, &sender_pub_nonce, fee, tx.lock_height())
+		.unwrap();
+
+	// Build the response, which should contain sR, blinding excess xR * G, public
+	// nonce kR * G
+	let mut partial_tx = build_partial_tx(
+		&partial_tx.id,
+		keychain,
+		amount,
+		kernel_offset,
+		Some(sig_part),
+		tx,
+	);
+	partial_tx.phase = PartialTxPhase::ReceiverInitiation;
+
+	Ok(partial_tx)
+}
+
+/// Receive Part 3 of interactive transactions from sender, Sender Confirmation
+/// Return Ok/Error
+/// -Receiver receives sS
+/// -Receiver verifies sender's sig, by verifying that kS * G + e *xS * G = sS * G
+/// -Receiver calculates final sig as s=(sS+sR, kS * G+kR * G)
+/// -Receiver puts into TX kernel:
+///
+/// Signature S
+/// pubkey xR * G+xS * G
+/// fee (= M)
+/// -Receiver sends completed TX to mempool. responds OK to sender
+
+fn handle_sender_confirmation(
+	config: &WalletConfig,
+	keychain: &Keychain,
+	partial_tx: &PartialTx,
+	fluff: bool,
+) -> Result<PartialTx, Error> {
+	let (amount, sender_pub_blinding, sender_pub_nonce, kernel_offset, sender_sig_part, tx) =
+		read_partial_tx(keychain, partial_tx)?;
+	let sender_sig_part = sender_sig_part.unwrap();
+	let res = keychain.aggsig_verify_partial_sig(
+		&partial_tx.id,
+		&sender_sig_part,
+		&sender_pub_nonce,
+		&sender_pub_blinding,
+		tx.fee(),
+		tx.lock_height(),
+	);
+
+	if !res {
+		error!(LOGGER, "Partial Sig from sender invalid.");
+		return Err(ErrorKind::Signature("Partial Sig from sender invalid."))?;
+	}
+
+	// Just calculate our sig part again instead of storing
+	let our_sig_part = keychain
+		.aggsig_calculate_partial_sig(
+			&partial_tx.id,
+			&sender_pub_nonce,
+			tx.fee(),
+			tx.lock_height(),
+		)
+		.unwrap();
+
+	// And the final signature
+	let final_sig = keychain
+		.aggsig_calculate_final_sig(
+			&partial_tx.id,
+			&sender_sig_part,
+			&our_sig_part,
+			&sender_pub_nonce,
+		)
+		.unwrap();
+
+	// Calculate the final public key (for our own sanity check)
+	let final_pubkey = keychain
+		.aggsig_calculate_final_pubkey(&partial_tx.id, &sender_pub_blinding)
+		.unwrap();
+
+	// Check our final sig verifies
+	let res = keychain.aggsig_verify_final_sig_build_msg(
+		&final_sig,
+		&final_pubkey,
+		tx.fee(),
+		tx.lock_height(),
+	);
+
+	if !res {
+		error!(LOGGER, "Final aggregated signature invalid.");
+		return Err(ErrorKind::Signature("Final aggregated signature invalid."))?;
+	}
+
+	let final_tx = build_final_transaction(
+		&partial_tx.id,
+		config,
+		keychain,
+		amount,
+		kernel_offset,
+		&final_sig,
+		tx.clone(),
+	)?;
+
+	let tx_hex = to_hex(ser::ser_vec(&final_tx).unwrap());
+
+	let url;
+	if fluff {
+		url = format!(
+			"{}/v1/pool/push?fluff",
+			config.check_node_api_http_addr.as_str()
+		);
+	} else {
+		url = format!("{}/v1/pool/push", config.check_node_api_http_addr.as_str());
+	}
+	api::client::post(url.as_str(), &TxWrapper { tx_hex: tx_hex }).context(ErrorKind::Node)?;
+
+	// Return what we've actually posted
+	// TODO - why build_partial_tx here? Just a naming issue?
+	let mut partial_tx = build_partial_tx(
+		&partial_tx.id,
+		keychain,
+		amount,
+		kernel_offset,
+		Some(final_sig),
+		tx,
+	);
+	partial_tx.phase = PartialTxPhase::ReceiverConfirmation;
+	Ok(partial_tx)
 }
 
 /// Component used to receive coins, implements all the receiving end of the
 /// wallet REST API as well as some of the command-line operations.
 #[derive(Clone)]
 pub struct WalletReceiver {
-	pub key: ExtendedKey,
+	pub keychain: Keychain,
 	pub config: WalletConfig,
 }
 
-impl ApiEndpoint for WalletReceiver {
-	type ID = String;
-	type T = String;
-	type OP_IN = WalletReceiveRequest;
-	type OP_OUT = CbData;
+impl Handler for WalletReceiver {
+	fn handle(&self, req: &mut Request) -> IronResult<Response> {
+		let struct_body = req.get::<bodyparser::Struct<PartialTx>>();
 
-	fn operations(&self) -> Vec<Operation> {
-		vec![
-			Operation::Custom("coinbase".to_string()),
-			Operation::Custom("receive_json_tx".to_string())
-		]
-	}
+		let mut fluff = false;
+		if let Ok(params) = req.get_ref::<UrlEncodedQuery>() {
+			if let Some(_) = params.get("fluff") {
+				fluff = true;
+			}
+		}
 
-	fn operation(&self, op: String, input: WalletReceiveRequest) -> ApiResult<CbData> {
-		match op.as_str() {
-			"coinbase" => {
-				match input {
-					WalletReceiveRequest::Coinbase(cb_amount) => {
-						debug!("Operation {} with amount {}", op, cb_amount.amount);
-						if cb_amount.amount == 0 {
-							return Err(api::Error::Argument(format!("Zero amount not allowed.")));
-						}
-						let (out, kern) =
-							receive_coinbase(&self.config, &self.key, cb_amount.amount).map_err(|e| {
-									api::Error::Internal(format!("Error building coinbase: {:?}", e))
-								})?;
-						let out_bin =
-							ser::ser_vec(&out).map_err(|e| {
-									api::Error::Internal(format!("Error serializing output: {:?}", e))
-								})?;
-						let kern_bin =
-							ser::ser_vec(&kern).map_err(|e| {
-									api::Error::Internal(format!("Error serializing kernel: {:?}", e))
-								})?;
-						Ok(CbData {
-							output: util::to_hex(out_bin),
-							kernel: util::to_hex(kern_bin),
-						})
-					}
-					_ => Err(api::Error::Argument(format!("Incorrect request data: {}", op))),
+		if let Ok(Some(partial_tx)) = struct_body {
+			match partial_tx.phase {
+				PartialTxPhase::SenderInitiation => {
+					let resp_tx = handle_sender_initiation(
+						&self.config,
+						&self.keychain,
+						&partial_tx,
+					).map_err(|e| {
+						error!(LOGGER, "Phase 1 Sender Initiation -> Problematic partial tx, looks like this: {:?}", partial_tx);
+						api::Error::Internal(format!(
+							"Error processing partial transaction: {:?}",
+							e
+						))
+					})
+						.unwrap();
+					let json = serde_json::to_string(&resp_tx).unwrap();
+					Ok(Response::with((status::Ok, json)))
+				}
+				PartialTxPhase::SenderConfirmation => {
+					let resp_tx = handle_sender_confirmation(
+						&self.config,
+						&self.keychain,
+						&partial_tx,
+						fluff,
+					).map_err(|e| {
+						error!(LOGGER, "Phase 3 Sender Confirmation -> Problematic partial tx, looks like this: {:?}", partial_tx);
+						api::Error::Internal(format!(
+							"Error processing partial transaction: {:?}",
+							e
+						))
+					})
+						.unwrap();
+					let json = serde_json::to_string(&resp_tx).unwrap();
+					Ok(Response::with((status::Ok, json)))
+				}
+				_ => {
+					error!(LOGGER, "Unhandled Phase: {:?}", partial_tx);
+					Ok(Response::with((status::BadRequest, "Unhandled Phase")))
 				}
 			}
-			"receive_json_tx" => {
-				match input {
-					WalletReceiveRequest::PartialTransaction(partial_tx_str) => {
-						debug!("Operation {} with transaction {}", op, &partial_tx_str);
-						receive_json_tx(&self.config, &self.key, &partial_tx_str).map_err(|e| {
-							api::Error::Internal(format!("Error processing partial transaction: {:?}", e))
-						}).unwrap();
-
-						//TODO: Return emptiness for now, should be a proper enum return type
-						Ok(CbData {
-							output: String::from(""),
-							kernel: String::from(""),
-						})
-					}
-					_ => Err(api::Error::Argument(format!("Incorrect request data: {}", op))),
-				}
-			}
-			_ => Err(api::Error::Argument(format!("Unknown operation: {}", op))),
+		} else {
+			Ok(Response::with((status::BadRequest, "")))
 		}
 	}
 }
 
-/// Build a coinbase output and the corresponding kernel
-fn receive_coinbase(config: &WalletConfig, ext_key: &ExtendedKey, amount: u64) -> Result<(Output, TxKernel), Error> {
-	let secp = secp::Secp256k1::with_caps(secp::ContextFlag::Commit);
-
-	// operate within a lock on wallet data
-	WalletData::with_wallet(&config.data_file_dir, |wallet_data| {
-
-		// derive a new private for the reward
-		let next_child = wallet_data.next_child(ext_key.fingerprint);
-		let coinbase_key = ext_key.derive(&secp, next_child).map_err(|e| Error::Key(e))?;
-
-		// track the new output and return the stuff needed for reward
-		wallet_data.append_output(OutputData {
-			fingerprint: coinbase_key.fingerprint,
-			n_child: coinbase_key.n_child,
-			value: amount,
-			status: OutputStatus::Unconfirmed,
-		});
-		debug!("Using child {} for a new coinbase output.",
-		       coinbase_key.n_child);
-
-		Block::reward_output(coinbase_key.key, &secp).map_err(&From::from)
-	})?
+fn retrieve_existing_key(wallet_data: &WalletData, key_id: Identifier) -> (Identifier, u32) {
+	if let Some(existing) = wallet_data.get_output(&key_id) {
+		let key_id = existing.key_id.clone();
+		let derivation = existing.n_child;
+		(key_id, derivation)
+	} else {
+		panic!("should never happen");
+	}
 }
 
-/// Builds a full transaction from the partial one sent to us for transfer
-fn receive_transaction(config: &WalletConfig,
-					   ext_key: &ExtendedKey,
-                       amount: u64,
-                       blinding: SecretKey,
-                       partial: Transaction)
-                       -> Result<Transaction, Error> {
+fn next_available_key(wallet_data: &WalletData, keychain: &Keychain) -> (Identifier, u32) {
+	let root_key_id = keychain.root_key_id();
+	let derivation = wallet_data.next_child(root_key_id.clone());
+	let key_id = keychain.derive_key_id(derivation).unwrap();
+	(key_id, derivation)
+}
 
-	let secp = secp::Secp256k1::with_caps(secp::ContextFlag::Commit);
+/// Build a coinbase output and the corresponding kernel
+pub fn receive_coinbase(
+	config: &WalletConfig,
+	keychain: &Keychain,
+	block_fees: &BlockFees,
+) -> Result<(Output, TxKernel, BlockFees), Error> {
+	let root_key_id = keychain.root_key_id();
 
-	// operate within a lock on wallet data
-	WalletData::with_wallet(&config.data_file_dir, |wallet_data| {
+	let height = block_fees.height;
+	let lock_height = height + global::coinbase_maturity();
 
-		let next_child = wallet_data.next_child(ext_key.fingerprint);
-		let out_key = ext_key.derive(&secp, next_child).map_err(|e| Error::Key(e))?;
+	// Now acquire the wallet lock and write the new output.
+	let (key_id, derivation) = WalletData::with_wallet(&config.data_file_dir, |wallet_data| {
+		let key_id = block_fees.key_id();
+		let (key_id, derivation) = match key_id {
+			Some(key_id) => retrieve_existing_key(&wallet_data, key_id),
+			None => next_available_key(&wallet_data, keychain),
+		};
 
-		let (tx_final, _) = build::transaction(vec![build::initial_tx(partial),
-		                                            build::with_excess(blinding),
-		                                            build::output(amount, out_key.key)])?;
-
-		// make sure the resulting transaction is valid (could have been lied to
-		// on excess)
-		tx_final.validate(&secp)?;
-
-		// track the new output and return the finalized transaction to broadcast
-		wallet_data.append_output(OutputData {
-			fingerprint: out_key.fingerprint,
-			n_child: out_key.n_child,
-			value: amount,
+		// track the new output and return the stuff needed for reward
+		wallet_data.add_output(OutputData {
+			root_key_id: root_key_id.clone(),
+			key_id: key_id.clone(),
+			n_child: derivation,
+			value: reward(block_fees.fees),
 			status: OutputStatus::Unconfirmed,
+			height: height,
+			lock_height: lock_height,
+			is_coinbase: true,
+			block: None,
+			merkle_proof: None,
 		});
 
-		debug!("Using child {} for a new transaction output.",
-		       out_key.n_child);
+		(key_id, derivation)
+	})?;
 
-		Ok(tx_final)
-	})?
+	debug!(
+		LOGGER,
+		"receive_coinbase: built candidate output - {:?}, {}",
+		key_id.clone(),
+		derivation,
+	);
+
+	let mut block_fees = block_fees.clone();
+	block_fees.key_id = Some(key_id.clone());
+
+	debug!(LOGGER, "receive_coinbase: {:?}", block_fees);
+
+	let (out, kern) = Block::reward_output(&keychain, &key_id, block_fees.fees, block_fees.height)
+		.context(ErrorKind::Keychain)?;
+	Ok((out, kern, block_fees))
+}
+
+/// builds a final transaction after the aggregated sig exchange
+fn build_final_transaction(
+	tx_id: &Uuid,
+	config: &WalletConfig,
+	keychain: &Keychain,
+	amount: u64,
+	kernel_offset: BlindingFactor,
+	excess_sig: &secp::Signature,
+	tx: Transaction,
+) -> Result<Transaction, Error> {
+	let root_key_id = keychain.root_key_id();
+
+	// double check the fee amount included in the partial tx
+	// we don't necessarily want to just trust the sender
+	// we could just overwrite the fee here (but we won't) due to the ecdsa sig
+	let fee = tx_fee(tx.inputs.len(), tx.outputs.len() + 1, None);
+	if fee != tx.fee() {
+		return Err(ErrorKind::FeeDispute {
+			sender_fee: tx.fee(),
+			recipient_fee: fee,
+		})?;
+	}
+
+	if fee > amount {
+		info!(
+			LOGGER,
+			"Rejected the transfer because transaction fee ({}) exceeds received amount ({}).",
+			amount_to_hr_string(fee),
+			amount_to_hr_string(amount)
+		);
+		return Err(ErrorKind::FeeExceedsAmount {
+			sender_amount: amount,
+			recipient_fee: fee,
+		})?;
+	}
+
+	let out_amount = amount - fee;
+
+	// Get output we created in earlier step
+	// TODO: will just be one for now, support multiple later
+	let output_vec = keychain.aggsig_get_outputs(tx_id);
+
+	// operate within a lock on wallet data
+	let (key_id, derivation) = WalletData::with_wallet(&config.data_file_dir, |wallet_data| {
+		let (key_id, derivation) = retrieve_existing_key(&wallet_data, output_vec[0].clone());
+
+		wallet_data.add_output(OutputData {
+			root_key_id: root_key_id.clone(),
+			key_id: key_id.clone(),
+			n_child: derivation,
+			value: out_amount,
+			status: OutputStatus::Unconfirmed,
+			height: 0,
+			lock_height: 0,
+			is_coinbase: false,
+			block: None,
+			merkle_proof: None,
+		});
+
+		(key_id, derivation)
+	})?;
+
+	// Build final transaction, the sum of which should
+	// be the same as the exchanged excess values
+	let mut final_tx = build::transaction(
+		vec![
+			build::initial_tx(tx),
+			build::output(out_amount, key_id.clone()),
+			build::with_offset(kernel_offset),
+		],
+		keychain,
+	).context(ErrorKind::Keychain)?;
+
+	// build the final excess based on final tx and offset
+	let final_excess = {
+		// sum the input/output commitments on the final tx
+		let tx_excess = final_tx.sum_commitments().context(ErrorKind::Transaction)?;
+
+		// subtract the kernel_excess (built from kernel_offset)
+		let offset_excess = keychain
+			.secp()
+			.commit(0, kernel_offset.secret_key(&keychain.secp()).unwrap())
+			.unwrap();
+		keychain
+			.secp()
+			.commit_sum(vec![tx_excess], vec![offset_excess])
+			.context(ErrorKind::Transaction)?
+	};
+
+	// update the tx kernel to reflect the offset excess and sig
+	assert_eq!(final_tx.kernels.len(), 1);
+	final_tx.kernels[0].excess = final_excess.clone();
+	final_tx.kernels[0].excess_sig = excess_sig.clone();
+
+	// confirm the kernel verifies successfully before proceeding
+	final_tx.kernels[0]
+		.verify()
+		.context(ErrorKind::Transaction)?;
+
+	// confirm the overall transaction is valid (including the updated kernel)
+	let _ = final_tx.validate().context(ErrorKind::Transaction)?;
+
+	debug!(
+		LOGGER,
+		"Finalized transaction and built output - {:?}, {:?}, {}",
+		root_key_id.clone(),
+		key_id.clone(),
+		derivation,
+	);
+
+	Ok(final_tx)
 }

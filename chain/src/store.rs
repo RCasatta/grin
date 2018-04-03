@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,14 @@
 
 use std::sync::Arc;
 
-use secp::pedersen::Commitment;
+use util::secp::pedersen::Commitment;
 
 use types::*;
 use core::core::hash::{Hash, Hashed};
-use core::core::{Block, BlockHeader, Output};
+use core::core::{Block, BlockHeader};
 use core::consensus::TargetError;
 use core::core::target::Difficulty;
-use grin_store::{self, Error, to_key, u64_to_key, option_to_not_found};
+use grin_store::{self, option_to_not_found, to_key, Error, u64_to_key};
 
 const STORE_SUBPATH: &'static str = "chain";
 
@@ -31,8 +31,11 @@ const BLOCK_HEADER_PREFIX: u8 = 'h' as u8;
 const BLOCK_PREFIX: u8 = 'b' as u8;
 const HEAD_PREFIX: u8 = 'H' as u8;
 const HEADER_HEAD_PREFIX: u8 = 'I' as u8;
+const SYNC_HEAD_PREFIX: u8 = 's' as u8;
 const HEADER_HEIGHT_PREFIX: u8 = '8' as u8;
-const OUTPUT_COMMIT_PREFIX: u8 = 'o' as u8;
+const COMMIT_POS_PREFIX: u8 = 'c' as u8;
+const BLOCK_MARKER_PREFIX: u8 = 'm' as u8;
+const BLOCK_PMMR_FILE_METADATA_PREFIX: u8 = 'p' as u8;
 
 /// An implementation of the ChainStore trait backed by a simple key-value
 /// store.
@@ -54,8 +57,7 @@ impl ChainStore for ChainKVStore {
 	}
 
 	fn head_header(&self) -> Result<BlockHeader, Error> {
-		let head: Tip = try!(option_to_not_found(self.db.get_ser(&vec![HEAD_PREFIX])));
-		self.get_block_header(&head.last_block_h)
+		self.get_block_header(&try!(self.head()).last_block_h)
 	}
 
 	fn save_head(&self, t: &Tip) -> Result<(), Error> {
@@ -78,39 +80,61 @@ impl ChainStore for ChainKVStore {
 		self.db.put_ser(&vec![HEADER_HEAD_PREFIX], t)
 	}
 
+	fn get_sync_head(&self) -> Result<Tip, Error> {
+		option_to_not_found(self.db.get_ser(&vec![SYNC_HEAD_PREFIX]))
+	}
+
+	fn save_sync_head(&self, t: &Tip) -> Result<(), Error> {
+		self.db.put_ser(&vec![SYNC_HEAD_PREFIX], t)
+	}
+
+	// Reset both header_head and sync_head to the current head of the body chain
+	fn reset_head(&self) -> Result<(), Error> {
+		let tip = self.head()?;
+		self.save_header_head(&tip)?;
+		self.save_sync_head(&tip)
+	}
+
 	fn get_block(&self, h: &Hash) -> Result<Block, Error> {
 		option_to_not_found(self.db.get_ser(&to_key(BLOCK_PREFIX, &mut h.to_vec())))
 	}
 
-	fn get_block_header(&self, h: &Hash) -> Result<BlockHeader, Error> {
-		option_to_not_found(self.db.get_ser(
-			&to_key(BLOCK_HEADER_PREFIX, &mut h.to_vec()),
-		))
-	}
-
-	fn check_block_exists(&self, h: &Hash) -> Result<bool, Error> {
+	fn block_exists(&self, h: &Hash) -> Result<bool, Error> {
 		self.db.exists(&to_key(BLOCK_PREFIX, &mut h.to_vec()))
 	}
 
+	fn get_block_header(&self, h: &Hash) -> Result<BlockHeader, Error> {
+		option_to_not_found(
+			self.db
+				.get_ser(&to_key(BLOCK_HEADER_PREFIX, &mut h.to_vec())),
+		)
+	}
+
+	/// Save the block and its header
 	fn save_block(&self, b: &Block) -> Result<(), Error> {
-		// saving the block and its header
-		let mut batch = self.db
+		let batch = self.db
 			.batch()
 			.put_ser(&to_key(BLOCK_PREFIX, &mut b.hash().to_vec())[..], b)?
 			.put_ser(
 				&to_key(BLOCK_HEADER_PREFIX, &mut b.hash().to_vec())[..],
 				&b.header,
 			)?;
-
-		// saving the full output under its hash, as well as a commitment to hash index
-		for out in &b.outputs {
-			let mut out_bytes = out.commit.as_ref().to_vec();
-			batch = batch.put_ser(
-				&to_key(OUTPUT_COMMIT_PREFIX, &mut out_bytes)[..],
-				out,
-			)?;
-		}
 		batch.write()
+	}
+
+	/// Delete a full block. Does not delete any record associated with a block
+	/// header.
+	fn delete_block(&self, bh: &Hash) -> Result<(), Error> {
+		self.db.delete(&to_key(BLOCK_PREFIX, &mut bh.to_vec())[..])
+	}
+
+	fn is_on_current_chain(&self, header: &BlockHeader) -> Result<(), Error> {
+		let header_at_height = self.get_header_by_height(header.height)?;
+		if header.hash() == header_at_height.hash() {
+			Ok(())
+		} else {
+			Err(Error::NotFoundErr)
+		}
 	}
 
 	fn save_block_header(&self, bh: &BlockHeader) -> Result<(), Error> {
@@ -122,42 +146,106 @@ impl ChainStore for ChainKVStore {
 
 	fn get_header_by_height(&self, height: u64) -> Result<BlockHeader, Error> {
 		option_to_not_found(self.db.get_ser(&u64_to_key(HEADER_HEIGHT_PREFIX, height)))
+			.and_then(|hash| self.get_block_header(&hash))
 	}
 
-	fn get_output_by_commit(&self, commit: &Commitment) -> Result<Output, Error> {
-		option_to_not_found(self.db.get_ser(&to_key(
-			OUTPUT_COMMIT_PREFIX,
-			&mut commit.as_ref().to_vec(),
-		)))
+	fn save_header_height(&self, bh: &BlockHeader) -> Result<(), Error> {
+		self.db
+			.put_ser(&u64_to_key(HEADER_HEIGHT_PREFIX, bh.height), &bh.hash())
 	}
 
-	fn has_output_commit(&self, commit: &Commitment) -> Result<Hash, Error> {
-		option_to_not_found(self.db.get_ser(&to_key(
-			OUTPUT_COMMIT_PREFIX,
-			&mut commit.as_ref().to_vec(),
-		)))
+	fn delete_header_by_height(&self, height: u64) -> Result<(), Error> {
+		self.db.delete(&u64_to_key(HEADER_HEIGHT_PREFIX, height))
 	}
 
-	fn setup_height(&self, bh: &BlockHeader) -> Result<(), Error> {
+	fn save_output_pos(&self, commit: &Commitment, pos: u64) -> Result<(), Error> {
 		self.db.put_ser(
-			&u64_to_key(HEADER_HEIGHT_PREFIX, bh.height),
-			bh,
-		)?;
+			&to_key(COMMIT_POS_PREFIX, &mut commit.as_ref().to_vec())[..],
+			&pos,
+		)
+	}
 
-		let mut prev_h = bh.previous;
-		let mut prev_height = bh.height - 1;
-		while prev_height > 0 {
-			let prev = self.get_header_by_height(prev_height)?;
-			if prev.hash() != prev_h {
-				let real_prev = self.get_block_header(&prev_h)?;
-				self.db.put_ser(
-					&u64_to_key(HEADER_HEIGHT_PREFIX, real_prev.height),
-					&real_prev,
-				).unwrap();
-				prev_h = real_prev.previous;
-				prev_height = real_prev.height - 1;
-			} else {
-				break;
+	fn get_output_pos(&self, commit: &Commitment) -> Result<u64, Error> {
+		option_to_not_found(
+			self.db
+				.get_ser(&to_key(COMMIT_POS_PREFIX, &mut commit.as_ref().to_vec())),
+		)
+	}
+
+	fn delete_output_pos(&self, commit: &[u8]) -> Result<(), Error> {
+		self.db
+			.delete(&to_key(COMMIT_POS_PREFIX, &mut commit.to_vec()))
+	}
+
+	fn save_block_marker(&self, bh: &Hash, marker: &(u64, u64)) -> Result<(), Error> {
+		self.db
+			.put_ser(&to_key(BLOCK_MARKER_PREFIX, &mut bh.to_vec())[..], &marker)
+	}
+
+	fn get_block_marker(&self, bh: &Hash) -> Result<(u64, u64), Error> {
+		option_to_not_found(
+			self.db
+				.get_ser(&to_key(BLOCK_MARKER_PREFIX, &mut bh.to_vec())),
+		)
+	}
+
+	fn delete_block_marker(&self, bh: &Hash) -> Result<(), Error> {
+		self.db
+			.delete(&to_key(BLOCK_MARKER_PREFIX, &mut bh.to_vec()))
+	}
+
+	fn save_block_pmmr_file_metadata(
+		&self,
+		h: &Hash,
+		md: &PMMRFileMetadataCollection,
+	) -> Result<(), Error> {
+		self.db.put_ser(
+			&to_key(BLOCK_PMMR_FILE_METADATA_PREFIX, &mut h.to_vec())[..],
+			&md,
+		)
+	}
+
+	fn get_block_pmmr_file_metadata(&self, h: &Hash) -> Result<PMMRFileMetadataCollection, Error> {
+		option_to_not_found(
+			self.db
+				.get_ser(&to_key(BLOCK_PMMR_FILE_METADATA_PREFIX, &mut h.to_vec())),
+		)
+	}
+
+	fn delete_block_pmmr_file_metadata(&self, h: &Hash) -> Result<(), Error> {
+		self.db
+			.delete(&to_key(BLOCK_PMMR_FILE_METADATA_PREFIX, &mut h.to_vec())[..])
+	}
+
+	/// Maintain consistency of the "header_by_height" index by traversing back
+	/// through the current chain and updating "header_by_height" until we reach
+	/// a block_header that is consistent with its height (everything prior to
+	/// this will be consistent).
+	/// We need to handle the case where we have no index entry for a given
+	/// height to account for the case where we just switched to a new fork and
+	/// the height jumped beyond current chain height.
+	fn setup_height(&self, header: &BlockHeader, old_tip: &Tip) -> Result<(), Error> {
+		// remove headers ahead if we backtracked
+		for n in header.height..old_tip.height {
+			self.delete_header_by_height(n)?;
+		}
+		self.build_by_height_index(header, false)
+	}
+
+	fn build_by_height_index(&self, header: &BlockHeader, force: bool) -> Result<(), Error> {
+		self.save_header_height(&header)?;
+
+		if header.height > 0 {
+			let mut prev_header = self.get_block_header(&header.previous)?;
+			while prev_header.height > 0 {
+				if !force {
+					if let Ok(_) = self.is_on_current_chain(&prev_header) {
+						break;
+					}
+				}
+				self.save_header_height(&prev_header)?;
+
+				prev_header = self.get_block_header(&prev_header.previous)?;
 			}
 		}
 		Ok(())
@@ -169,8 +257,15 @@ impl ChainStore for ChainKVStore {
 /// previous difficulties). Mostly used by the consensus next difficulty
 /// calculation.
 pub struct DifficultyIter {
-	next: Hash,
+	start: Hash,
 	store: Arc<ChainStore>,
+
+	// maintain state for both the "next" header in this iteration
+	// and its previous header in the chain ("next next" in the iteration)
+	// so we effectively read-ahead as we iterate through the chain back
+	// toward the genesis block (while maintaining current state)
+	header: Option<BlockHeader>,
+	prev_header: Option<BlockHeader>,
 }
 
 impl DifficultyIter {
@@ -178,8 +273,10 @@ impl DifficultyIter {
 	/// the provided block hash.
 	pub fn from(start: Hash, store: Arc<ChainStore>) -> DifficultyIter {
 		DifficultyIter {
-			next: start,
+			start: start,
 			store: store,
+			header: None,
+			prev_header: None,
 		}
 	}
 }
@@ -188,16 +285,27 @@ impl Iterator for DifficultyIter {
 	type Item = Result<(u64, Difficulty), TargetError>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		let bhe = self.store.get_block_header(&self.next);
-		match bhe {
-			Err(e) => Some(Err(TargetError(e.to_string()))),
-			Ok(bh) => {
-				if bh.height == 0 {
-					return None;
-				}
-				self.next = bh.previous;
-				Some(Ok((bh.timestamp.to_timespec().sec as u64, bh.difficulty)))
-			}
+		// Get both header and previous_header if this is the initial iteration.
+		// Otherwise move prev_header to header and get the next prev_header.
+		self.header = if self.header.is_none() {
+			self.store.get_block_header(&self.start).ok()
+		} else {
+			self.prev_header.clone()
+		};
+
+		// If we have a header we can do this iteration.
+		// Otherwise we are done.
+		if let Some(header) = self.header.clone() {
+			self.prev_header = self.store.get_block_header(&header.previous).ok();
+
+			let prev_difficulty = self.prev_header
+				.clone()
+				.map_or(Difficulty::zero(), |x| x.total_difficulty);
+			let difficulty = header.total_difficulty - prev_difficulty;
+
+			Some(Ok((header.timestamp.to_timespec().sec as u64, difficulty)))
+		} else {
+			return None;
 		}
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,38 +22,36 @@
 
 #[macro_use]
 extern crate bitflags;
+extern crate bytes;
 #[macro_use]
 extern crate enum_primitive;
+
 #[macro_use]
 extern crate grin_core as core;
 extern crate grin_store;
 extern crate grin_util as util;
-#[macro_use]
-extern crate log;
-extern crate futures;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate bytes;
-extern crate tokio_timer;
+extern crate num;
 extern crate rand;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate slog;
 extern crate time;
-extern crate num;
 
 mod conn;
 pub mod handshake;
-mod rate_limit;
-mod msg;
+pub mod msg;
 mod peer;
+mod peers;
 mod protocol;
-mod server;
+mod serv;
 mod store;
-mod types;
+pub mod types;
 
-pub use server::{Server, DummyAdapter};
+pub use serv::{DummyAdapter, Server};
+pub use peers::Peers;
 pub use peer::Peer;
-pub use types::{P2PConfig, NetAdapter, MAX_LOCATORS, MAX_BLOCK_HEADERS, MAX_PEER_ADDRS,
-                Capabilities, UNKNOWN, FULL_NODE, FULL_HIST, PeerInfo, Error};
-pub use store::{PeerStore, PeerData, State};
+pub use types::{Capabilities, ChainAdapter, Error, P2PConfig, PeerInfo, TxHashSetRead,
+                MAX_BLOCK_HEADERS, MAX_PEER_ADDRS};
+pub use store::{PeerData, State};

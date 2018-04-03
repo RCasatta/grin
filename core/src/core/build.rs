@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,133 +25,152 @@
 //! build::transaction(vec![input_rand(75), output_rand(42), output_rand(32),
 //!   with_fee(1)])
 
-use byteorder::{ByteOrder, BigEndian};
-use secp::{self, Secp256k1};
-use secp::key::SecretKey;
-use rand::os::OsRng;
+use util::{kernel_sig_msg, secp};
 
-use core::{Transaction, Input, Output, DEFAULT_OUTPUT};
+use core::{Input, Output, OutputFeatures, ProofMessageElements, Transaction, TxKernel};
+use core::hash::Hash;
+use core::pmmr::MerkleProof;
+use keychain;
+use keychain::{BlindSum, BlindingFactor, Identifier, Keychain};
+use util::LOGGER;
 
 /// Context information available to transaction combinators.
-pub struct Context {
-	secp: Secp256k1,
-	rng: OsRng,
-}
-
-/// Accumulator to compute the sum of blinding factors. Keeps track of each
-/// factor as well as the "sign" with which they should be combined.
-pub struct BlindSum {
-	positive: Vec<SecretKey>,
-	negative: Vec<SecretKey>,
-}
-
-impl BlindSum {
-	/// Creates a new blinding factor sum.
-	fn new() -> BlindSum {
-		BlindSum {
-			positive: vec![],
-			negative: vec![],
-		}
-	}
-
-	/// Adds the provided key to the sum of blinding factors.
-	fn add(self, key: SecretKey) -> BlindSum {
-		let mut new_pos = self.positive;
-		new_pos.push(key);
-		BlindSum {
-			positive: new_pos,
-			negative: self.negative,
-		}
-	}
-
-	/// Subtractss the provided key to the sum of blinding factors.
-	fn sub(self, key: SecretKey) -> BlindSum {
-		let mut new_neg = self.negative;
-		new_neg.push(key);
-		BlindSum {
-			positive: self.positive,
-			negative: new_neg,
-		}
-	}
-
-	/// Computes the sum of blinding factors from all the ones that have been
-	/// added and subtracted.
-	fn sum(self, secp: &Secp256k1) -> Result<SecretKey, secp::Error> {
-		secp.blind_sum(self.positive, self.negative)
-	}
+pub struct Context<'a> {
+	keychain: &'a Keychain,
 }
 
 /// Function type returned by the transaction combinators. Transforms a
 /// (Transaction, BlindSum) pair into another, provided some context.
-type Append = for<'a> Fn(&'a mut Context, (Transaction, BlindSum)) -> (Transaction, BlindSum);
+pub type Append = for<'a> Fn(&'a mut Context, (Transaction, TxKernel, BlindSum))
+	-> (Transaction, TxKernel, BlindSum);
 
 /// Adds an input with the provided value and blinding key to the transaction
 /// being built.
-pub fn input(value: u64, blinding: SecretKey) -> Box<Append> {
-	Box::new(move |build, (tx, sum)| -> (Transaction, BlindSum) {
-		let commit = build.secp.commit(value, blinding).unwrap();
-		(tx.with_input(Input(commit)), sum.sub(blinding))
-	})
+fn build_input(
+	value: u64,
+	features: OutputFeatures,
+	block_hash: Option<Hash>,
+	merkle_proof: Option<MerkleProof>,
+	key_id: Identifier,
+) -> Box<Append> {
+	Box::new(
+		move |build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			let commit = build.keychain.commit(value, &key_id).unwrap();
+			let input = Input::new(features, commit, block_hash.clone(), merkle_proof.clone());
+			(tx.with_input(input), kern, sum.sub_key_id(key_id.clone()))
+		},
+	)
 }
 
-/// Adds an input with the provided value and a randomly generated blinding
-/// key to the transaction being built. This has no real use in practical
-/// applications but is very convenient for tests.
-pub fn input_rand(value: u64) -> Box<Append> {
-	Box::new(move |build, (tx, sum)| -> (Transaction, BlindSum) {
-		let blinding = SecretKey::new(&build.secp, &mut build.rng);
-		let commit = build.secp.commit(value, blinding).unwrap();
-		(tx.with_input(Input(commit)), sum.sub(blinding))
-	})
-}
-
-/// Adds an output with the provided value and blinding key to the transaction
+/// Adds an input with the provided value and blinding key to the transaction
 /// being built.
-pub fn output(value: u64, blinding: SecretKey) -> Box<Append> {
-	Box::new(move |build, (tx, sum)| -> (Transaction, BlindSum) {
-		let commit = build.secp.commit(value, blinding).unwrap();
-		let rproof = build.secp.range_proof(0, value, blinding, commit);
-		(tx.with_output(Output {
-			features: DEFAULT_OUTPUT,
-			commit: commit,
-			proof: rproof,
-		}),
-		 sum.add(blinding))
-	})
+pub fn input(value: u64, key_id: Identifier) -> Box<Append> {
+	debug!(
+		LOGGER,
+		"Building input (spending regular output): {}, {}", value, key_id
+	);
+	build_input(value, OutputFeatures::DEFAULT_OUTPUT, None, None, key_id)
 }
 
-/// Adds an output with the provided value and a randomly generated blinding
-/// key to the transaction being built. This has no real use in practical
-/// applications but is very convenient for tests.
-pub fn output_rand(value: u64) -> Box<Append> {
-	Box::new(move |build, (tx, sum)| -> (Transaction, BlindSum) {
-		let blinding = SecretKey::new(&build.secp, &mut build.rng);
-		let commit = build.secp.commit(value, blinding).unwrap();
-		let rproof = build.secp.range_proof(0, value, blinding, commit);
-		(tx.with_output(Output {
-			features: DEFAULT_OUTPUT,
-			commit: commit,
-			proof: rproof,
-		}),
-		 sum.add(blinding))
-	})
+/// Adds a coinbase input spending a coinbase output.
+/// We will use the block hash to verify coinbase maturity.
+pub fn coinbase_input(
+	value: u64,
+	block_hash: Hash,
+	merkle_proof: MerkleProof,
+	key_id: Identifier,
+) -> Box<Append> {
+	debug!(
+		LOGGER,
+		"Building input (spending coinbase): {}, {}", value, key_id
+	);
+	build_input(
+		value,
+		OutputFeatures::COINBASE_OUTPUT,
+		Some(block_hash),
+		Some(merkle_proof),
+		key_id,
+	)
+}
+
+/// Adds an output with the provided value and key identifier from the
+/// keychain.
+pub fn output(value: u64, key_id: Identifier) -> Box<Append> {
+	Box::new(
+		move |build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			debug!(LOGGER, "Building an output: {}, {}", value, key_id,);
+
+			let commit = build.keychain.commit(value, &key_id).unwrap();
+			trace!(LOGGER, "Builder - Pedersen Commit is: {:?}", commit,);
+
+			let msg = ProofMessageElements::new(value, &key_id);
+
+			let rproof = build
+				.keychain
+				.range_proof(value, &key_id, commit, None, msg.to_proof_message())
+				.unwrap();
+
+			(
+				tx.with_output(Output {
+					features: OutputFeatures::DEFAULT_OUTPUT,
+					commit: commit,
+					proof: rproof,
+				}),
+				kern,
+				sum.add_key_id(key_id.clone()),
+			)
+		},
+	)
 }
 
 /// Sets the fee on the transaction being built.
 pub fn with_fee(fee: u64) -> Box<Append> {
-	Box::new(move |_build, (tx, sum)| -> (Transaction, BlindSum) { (tx.with_fee(fee), sum) })
+	Box::new(
+		move |_build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			(tx, kern.with_fee(fee), sum)
+		},
+	)
 }
 
-/// Sets a known excess value on the transaction being built. Usually used in
+/// Sets the lock_height on the transaction being built.
+pub fn with_lock_height(lock_height: u64) -> Box<Append> {
+	Box::new(
+		move |_build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			(tx, kern.with_lock_height(lock_height), sum)
+		},
+	)
+}
+
+/// Adds a known excess value on the transaction being built. Usually used in
 /// combination with the initial_tx function when a new transaction is built
 /// by adding to a pre-existing one.
-pub fn with_excess(excess: SecretKey) -> Box<Append> {
-	Box::new(move |_build, (tx, sum)| -> (Transaction, BlindSum) { (tx, sum.add(excess)) })
+pub fn with_excess(excess: BlindingFactor) -> Box<Append> {
+	Box::new(
+		move |_build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			(tx, kern, sum.add_blinding_factor(excess.clone()))
+		},
+	)
+}
+
+/// Sets a known tx "offset". Used in final step of tx construction.
+pub fn with_offset(offset: BlindingFactor) -> Box<Append> {
+	Box::new(
+		move |_build, (tx, kern, sum)| -> (Transaction, TxKernel, BlindSum) {
+			(tx.with_offset(offset), kern, sum)
+		},
+	)
 }
 
 /// Sets an initial transaction to add to when building a new transaction.
-pub fn initial_tx(tx: Transaction) -> Box<Append> {
-	Box::new(move |_build, (_, sum)| -> (Transaction, BlindSum) { (tx.clone(), sum) })
+/// We currently only support building a tx with a single kernel with build::transaction()
+pub fn initial_tx(mut tx: Transaction) -> Box<Append> {
+	assert_eq!(tx.kernels.len(), 1);
+	let kern = tx.kernels.remove(0);
+	Box::new(
+		move |_build, (_, _, sum)| -> (Transaction, TxKernel, BlindSum) {
+			(tx.clone(), kern.clone(), sum)
+		},
+	)
 }
 
 /// Builds a new transaction by combining all the combinators provided in a
@@ -160,53 +179,138 @@ pub fn initial_tx(tx: Transaction) -> Box<Append> {
 ///
 /// Example:
 /// let (tx1, sum) = build::transaction(vec![input_rand(4), output_rand(1),
-///   with_fee(1)]).unwrap();
+///   with_fee(1)], keychain).unwrap();
 /// let (tx2, _) = build::transaction(vec![initial_tx(tx1), with_excess(sum),
-///   output_rand(2)]).unwrap();
+///   output_rand(2)], keychain).unwrap();
 ///
-pub fn transaction(elems: Vec<Box<Append>>) -> Result<(Transaction, SecretKey), secp::Error> {
-	let mut ctx = Context {
-		secp: Secp256k1::with_caps(secp::ContextFlag::Commit),
-		rng: OsRng::new().unwrap(),
-	};
-	let (mut tx, sum) = elems.iter().fold((Transaction::empty(), BlindSum::new()),
-	                                      |acc, elem| elem(&mut ctx, acc));
+pub fn partial_transaction(
+	elems: Vec<Box<Append>>,
+	keychain: &keychain::Keychain,
+) -> Result<(Transaction, BlindingFactor), keychain::Error> {
+	let mut ctx = Context { keychain };
+	let (mut tx, kern, sum) = elems.iter().fold(
+		(Transaction::empty(), TxKernel::empty(), BlindSum::new()),
+		|acc, elem| elem(&mut ctx, acc),
+	);
+	let blind_sum = ctx.keychain.blind_sum(&sum)?;
 
-	let blind_sum = sum.sum(&ctx.secp)?;
-	let msg = secp::Message::from_slice(&u64_to_32bytes(tx.fee))?;
-	let sig = ctx.secp.sign(&msg, &blind_sum)?;
-	tx.excess_sig = sig.serialize_der(&ctx.secp);
+	// we only support building a tx with a single kernel via build::transaction()
+	assert!(tx.kernels.is_empty());
+	tx.kernels.push(kern);
 
 	Ok((tx, blind_sum))
 }
 
-fn u64_to_32bytes(n: u64) -> [u8; 32] {
-	let mut bytes = [0; 32];
-	BigEndian::write_u64(&mut bytes[24..32], n);
-	bytes
+/// Builds a complete transaction.
+pub fn transaction(
+	elems: Vec<Box<Append>>,
+	keychain: &keychain::Keychain,
+) -> Result<Transaction, keychain::Error> {
+	let (mut tx, blind_sum) = partial_transaction(elems, keychain)?;
+	assert_eq!(tx.kernels.len(), 1);
+
+	let mut kern = tx.kernels.remove(0);
+	let msg = secp::Message::from_slice(&kernel_sig_msg(kern.fee, kern.lock_height))?;
+
+	let skey = blind_sum.secret_key(&keychain.secp())?;
+	kern.excess = keychain.secp().commit(0, skey)?;
+	kern.excess_sig = Keychain::aggsig_sign_with_blinding(&keychain.secp(), &msg, &blind_sum)?;
+
+	tx.kernels.push(kern);
+
+	Ok(tx)
 }
 
+/// Builds a complete transaction, splitting the key and
+/// setting the excess, excess_sig and tx offset as necessary.
+pub fn transaction_with_offset(
+	elems: Vec<Box<Append>>,
+	keychain: &keychain::Keychain,
+) -> Result<Transaction, keychain::Error> {
+	let mut ctx = Context { keychain };
+	let (mut tx, mut kern, sum) = elems.iter().fold(
+		(Transaction::empty(), TxKernel::empty(), BlindSum::new()),
+		|acc, elem| elem(&mut ctx, acc),
+	);
+	let blind_sum = ctx.keychain.blind_sum(&sum)?;
+
+	let split = blind_sum.split(&keychain.secp())?;
+	let k1 = split.blind_1;
+	let k2 = split.blind_2;
+
+	let msg = secp::Message::from_slice(&kernel_sig_msg(kern.fee, kern.lock_height))?;
+
+	// generate kernel excess and excess_sig using the split key k1
+	let skey = k1.secret_key(&keychain.secp())?;
+	kern.excess = ctx.keychain.secp().commit(0, skey)?;
+	kern.excess_sig = Keychain::aggsig_sign_with_blinding(&keychain.secp(), &msg, &k1)?;
+
+	// store the kernel offset (k2) on the tx itself
+	// commitments will sum correctly when including the offset
+	tx.offset = k2.clone();
+
+	assert!(tx.kernels.is_empty());
+	tx.kernels.push(kern);
+
+	Ok(tx)
+}
 
 // Just a simple test, most exhaustive tests in the core mod.rs.
 #[cfg(test)]
 mod test {
 	use super::*;
 
-	use secp::{self, key, Secp256k1};
-
 	#[test]
 	fn blind_simple_tx() {
-		let secp = Secp256k1::with_caps(secp::ContextFlag::Commit);
-		let (tx, _) =
-			transaction(vec![input_rand(10), input_rand(11), output_rand(20), with_fee(1)])
-				.unwrap();
-		tx.verify_sig(&secp).unwrap();
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		let tx = transaction(
+			vec![
+				input(10, key_id1),
+				input(12, key_id2),
+				output(20, key_id3),
+				with_fee(2),
+			],
+			&keychain,
+		).unwrap();
+
+		tx.validate().unwrap();
 	}
+
+	#[test]
+	fn blind_simple_tx_with_offset() {
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		let tx = transaction_with_offset(
+			vec![
+				input(10, key_id1),
+				input(12, key_id2),
+				output(20, key_id3),
+				with_fee(2),
+			],
+			&keychain,
+		).unwrap();
+
+		tx.validate().unwrap();
+	}
+
 	#[test]
 	fn blind_simpler_tx() {
-		let secp = Secp256k1::with_caps(secp::ContextFlag::Commit);
-		let (tx, _) = transaction(vec![input_rand(6), output(2, key::ONE_KEY), with_fee(4)])
-			.unwrap();
-		tx.verify_sig(&secp).unwrap();
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+
+		let tx = transaction(
+			vec![input(6, key_id1), output(2, key_id2), with_fee(4)],
+			&keychain,
+		).unwrap();
+
+		tx.validate().unwrap();
 	}
 }

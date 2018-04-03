@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,39 +21,37 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
-#[macro_use]
-extern crate log;
-extern crate env_logger;
-extern crate futures;
-extern crate futures_cpupool as cpupool;
 extern crate hyper;
+extern crate itertools;
 extern crate rand;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
+#[macro_use]
+extern crate slog;
 extern crate time;
-extern crate tokio_core;
-extern crate tokio_timer;
-extern crate itertools;
 
 extern crate grin_api as api;
 extern crate grin_chain as chain;
-#[macro_use]
 extern crate grin_core as core;
+extern crate grin_keychain as keychain;
 extern crate grin_p2p as p2p;
 extern crate grin_pool as pool;
+extern crate grin_pow as pow;
 extern crate grin_store as store;
 extern crate grin_util as util;
 extern crate grin_wallet as wallet;
-extern crate grin_pow as pow;
-extern crate secp256k1zkp as secp;
 
 mod adapters;
+mod dandelion_monitor;
 mod server;
 mod seed;
 mod sync;
-mod types;
+pub mod types;
+pub mod stats;
 mod miner;
 
-pub use server::{Server};
-pub use types::{ServerConfig, Seeding, ServerStats};
+pub use server::Server;
+pub use types::{Seeding, ServerConfig};
+pub use stats::ServerStats;

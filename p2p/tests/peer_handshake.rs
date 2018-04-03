@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,74 +14,79 @@
 
 extern crate grin_core as core;
 extern crate grin_p2p as p2p;
-extern crate env_logger;
-extern crate futures;
-extern crate tokio_core;
+extern crate grin_util as util;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::thread;
 use std::time;
 
-use futures::future::Future;
-use tokio_core::net::TcpStream;
-use tokio_core::reactor::{self, Core};
-
 use core::core::target::Difficulty;
+use core::core::hash::Hash;
 use p2p::Peer;
+
+fn open_port() -> u16 {
+	// use port 0 to allow the OS to assign an open port
+	// TcpListener's Drop impl will unbind the port as soon as
+	// listener goes out of scope
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	listener.local_addr().unwrap().port()
+}
 
 // Starts a server and connects a client peer to it to check handshake,
 // followed by a ping/pong exchange to make sure the connection is live.
 #[test]
 fn peer_handshake() {
-	env_logger::init().unwrap();
+	util::init_test_logger();
 
-	let mut evtlp = Core::new().unwrap();
-	let handle = evtlp.handle();
-	let p2p_conf = p2p::P2PConfig::default();
+	let p2p_conf = p2p::P2PConfig {
+		host: "0.0.0.0".parse().unwrap(),
+		port: open_port(),
+		peers_allow: None,
+		peers_deny: None,
+		..p2p::P2PConfig::default()
+	};
 	let net_adapter = Arc::new(p2p::DummyAdapter {});
-	let server = p2p::Server::new(p2p::UNKNOWN, p2p_conf, net_adapter.clone());
-	let run_server = server.start(handle.clone());
+	let server = Arc::new(
+		p2p::Server::new(
+			".grin".to_owned(),
+			p2p::Capabilities::UNKNOWN,
+			p2p_conf.clone(),
+			net_adapter.clone(),
+			Hash::from_vec(vec![]),
+			Arc::new(AtomicBool::new(false)),
+		).unwrap(),
+	);
+
+	let p2p_inner = server.clone();
+	let _ = thread::spawn(move || p2p_inner.listen());
+
+	thread::sleep(time::Duration::from_secs(1));
+
+	let addr = SocketAddr::new(p2p_conf.host, p2p_conf.port);
+	let mut socket = TcpStream::connect_timeout(&addr, time::Duration::from_secs(10)).unwrap();
+
 	let my_addr = "127.0.0.1:5000".parse().unwrap();
+	let mut peer = Peer::connect(
+		&mut socket,
+		p2p::Capabilities::UNKNOWN,
+		Difficulty::one(),
+		my_addr,
+		&p2p::handshake::Handshake::new(Hash::from_vec(vec![]), p2p_conf.clone()),
+		net_adapter,
+	).unwrap();
 
-	let phandle = handle.clone();
-	let rhandle = handle.clone();
-	let timeout = reactor::Timeout::new(time::Duration::new(1, 0), &handle).unwrap();
-	let timeout_send = reactor::Timeout::new(time::Duration::new(2, 0), &handle).unwrap();
-	handle.spawn(timeout.from_err()
-		.and_then(move |_| {
-			let p2p_conf = p2p::P2PConfig::default();
-			let addr = SocketAddr::new(p2p_conf.host, p2p_conf.port);
-			let socket = TcpStream::connect(&addr, &phandle).map_err(|e| p2p::Error::Connection(e));
-			socket.and_then(move |socket| {
-					Peer::connect(socket,
-					              p2p::UNKNOWN,
-					              Difficulty::one(),
-					              my_addr,
-					              &p2p::handshake::Handshake::new())
-				})
-				.and_then(move |(socket, peer)| {
-					rhandle.spawn(peer.run(socket, net_adapter.clone()).map_err(|e| {
-						panic!("Client run failed: {:?}", e);
-					}));
-					peer.send_ping().unwrap();
-					timeout_send.from_err().map(|_| peer)
-				})
-				.and_then(|peer| {
-					let (sent, recv) = peer.transmitted_bytes();
-					assert!(sent > 0);
-					assert!(recv > 0);
-					Ok(())
-				})
-				.and_then(|_| {
-					assert!(server.peer_count() > 0);
-					server.stop();
-					Ok(())
-				})
-		})
-		.map_err(|e| {
-			panic!("Client connection failed: {:?}", e);
-		}));
+	assert!(peer.info.user_agent.ends_with(env!("CARGO_PKG_VERSION")));
 
-	evtlp.run(run_server).unwrap();
+	peer.start(socket);
+	thread::sleep(time::Duration::from_secs(1));
 
+	peer.send_ping(Difficulty::one(), 0).unwrap();
+	thread::sleep(time::Duration::from_secs(1));
+
+	let server_peer = server.peers.get_connected_peer(&my_addr).unwrap();
+	let server_peer = server_peer.read().unwrap();
+	assert_eq!(server_peer.info.total_difficulty, Difficulty::one());
+	assert!(server.peers.peer_count() > 0);
 }

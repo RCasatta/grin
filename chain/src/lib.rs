@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,23 +23,25 @@
 #[macro_use]
 extern crate bitflags;
 extern crate byteorder;
-#[macro_use]
-extern crate log;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate slog;
 extern crate time;
 
 extern crate grin_core as core;
+extern crate grin_keychain as keychain;
 extern crate grin_store;
-extern crate secp256k1zkp as secp;
+extern crate grin_util as util;
 
 mod chain;
 pub mod pipe;
 pub mod store;
+pub mod txhashset;
 pub mod types;
 
 // Re-export the base interface
 
 pub use chain::Chain;
-pub use types::{ChainStore, Tip, ChainAdapter, SYNC, NONE, SKIP_POW, EASY_POW, Options, Error};
+pub use types::{ChainAdapter, ChainStore, Error, Options, Tip};

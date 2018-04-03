@@ -1,24 +1,28 @@
 [package]
 name = "grin_pow"
-version = "0.1.0"
-authors = ["Ignotus Peverell <igno.peverell@protonmail.com>"]
+version = "0.2.0"
+
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
 workspace = ".."
+publish = false
 
 [dependencies]
-blake2-rfc = "~0.2.17"
-rand = "^0.3"
-time = "^0.1"
-env_logger="^0.3.5"
-log = "^0.3"
-lazy_static = "~0.2.8"
-serde = "~1.0.8"
-serde_derive = "~1.0.8"
-
-cuckoo_miner = { git = "https://github.com/mimblewimble/cuckoo-miner", tag="grin_integration_6"}
-#cuckoo_miner = { path = "../../cuckoo-miner"}
+blake2-rfc = "0.2"
+lazy_static = "0.2"
+rand = "0.3"
+serde = "1"
+serde_derive = "1"
+slog = { version = "~2.1", features = ["max_level_trace", "release_max_level_trace"] }
+time = "0.1"
 
 grin_core = { path = "../core" }
+grin_util = { path = "../util" }
 
-[dev_dependencies]
-grin_chain = { path = "../chain"}
-secp256k1zkp = { path = "../secp256k1zkp" }
+[dependencies.cuckoo_miner]
+git = "https://github.com/mimblewimble/cuckoo-miner"
+tag = "grin_integration_25"
+#path = "../../cuckoo-miner"
+#uncomment this feature to turn off plugin builds
+#features=["no-plugin-build"]
+#uncomment this feature to enable cuda builds (cuda toolkit must be installed)
+#features=["build-cuda-plugins"]

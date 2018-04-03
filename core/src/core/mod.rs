@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,25 +17,27 @@
 pub mod block;
 pub mod build;
 pub mod hash;
+pub mod id;
 pub mod pmmr;
-pub mod sumtree;
 pub mod target;
 pub mod transaction;
-//pub mod txoset;
+// pub mod txoset;
 #[allow(dead_code)]
 
-use std::fmt;
+use rand::{thread_rng, Rng};
+use std::{fmt, iter};
 use std::cmp::Ordering;
+use std::num::ParseFloatError;
+use consensus::GRIN_BASE;
 
-use secp::{self, Secp256k1};
-use secp::pedersen::*;
+use util::{secp, static_secp_instance};
+use util::secp::pedersen::*;
 
-pub use self::block::{Block, BlockHeader, DEFAULT_BLOCK};
-pub use self::transaction::{Transaction, Input, Output, TxKernel, COINBASE_KERNEL,
-                            COINBASE_OUTPUT, DEFAULT_OUTPUT};
-use self::hash::{Hash, Hashed, ZERO_HASH};
-use ser::{Writeable, Writer, Reader, Readable, Error};
-
+pub use self::block::*;
+pub use self::transaction::*;
+pub use self::id::ShortId;
+use self::hash::Hashed;
+use ser::{Error, Readable, Reader, Writeable, Writer};
 use global;
 
 /// Implemented by types that hold inputs and outputs including Pedersen
@@ -43,11 +45,11 @@ use global;
 /// summing, taking potential explicit overages of fees into account.
 pub trait Committed {
 	/// Gathers commitments and sum them.
-	fn sum_commitments(&self, secp: &Secp256k1) -> Result<Commitment, secp::Error> {
+	fn sum_commitments(&self) -> Result<Commitment, secp::Error> {
 		// first, verify each range proof
 		let ref outputs = self.outputs_committed();
 		for output in *outputs {
-			try!(output.verify_proof(secp))
+			try!(output.verify_proof())
 		}
 
 		// then gather the commitments
@@ -58,7 +60,11 @@ pub trait Committed {
 		// negative
 		let overage = self.overage();
 		if overage != 0 {
-			let over_commit = secp.commit_value(overage.abs() as u64).unwrap();
+			let over_commit = {
+				let secp = static_secp_instance();
+				let secp = secp.lock().unwrap();
+				secp.commit_value(overage.abs() as u64).unwrap()
+			};
 			if overage < 0 {
 				input_commits.push(over_commit);
 			} else {
@@ -67,7 +73,11 @@ pub trait Committed {
 		}
 
 		// sum all that stuff
-		secp.commit_sum(output_commits, input_commits)
+		{
+			let secp = static_secp_instance();
+			let secp = secp.lock().unwrap();
+			secp.commit_sum(output_commits, input_commits)
+		}
 	}
 
 	/// Vector of committed inputs to verify
@@ -83,11 +93,11 @@ pub trait Committed {
 
 /// Proof of work
 pub struct Proof {
-    /// The nonces
-	pub nonces:Vec<u32>,
-    
-    /// The proof size
-    pub proof_size: usize,
+	/// The nonces
+	pub nonces: Vec<u32>,
+
+	/// The proof size
+	pub proof_size: usize,
 }
 
 impl fmt::Debug for Proof {
@@ -127,9 +137,8 @@ impl Clone for Proof {
 }
 
 impl Proof {
-
 	/// Builds a proof with all bytes zeroed out
-	pub fn new(in_nonces:Vec<u32>) -> Proof {
+	pub fn new(in_nonces: Vec<u32>) -> Proof {
 		Proof {
 			proof_size: in_nonces.len(),
 			nonces: in_nonces,
@@ -137,10 +146,25 @@ impl Proof {
 	}
 
 	/// Builds a proof with all bytes zeroed out
-	pub fn zero(proof_size:usize) -> Proof {
+	pub fn zero(proof_size: usize) -> Proof {
 		Proof {
 			proof_size: proof_size,
-			nonces: vec![0;proof_size],
+			nonces: vec![0; proof_size],
+		}
+	}
+
+	/// Builds a proof with random POW data,
+	/// needed so that tests that ignore POW
+	/// don't fail due to duplicate hashes
+	pub fn random(proof_size: usize) -> Proof {
+		let mut rng = thread_rng();
+		let v: Vec<u32> = iter::repeat(())
+			.map(|()| rng.gen())
+			.take(proof_size)
+			.collect();
+		Proof {
+			proof_size: proof_size,
+			nonces: v,
 		}
 	}
 
@@ -185,87 +209,78 @@ impl Writeable for Proof {
 	}
 }
 
-/// Two hashes that will get hashed together in a Merkle tree to build the next
-/// level up.
-struct HPair(Hash, Hash);
+/// Common method for parsing an amount from human-readable, and converting
+/// to internally-compatible u64
 
-impl Writeable for HPair {
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
-		try!(writer.write_bytes(&self.0));
-		try!(writer.write_bytes(&self.1));
-		Ok(())
-	}
+pub fn amount_from_hr_string(amount: &str) -> Result<u64, ParseFloatError> {
+	let amount = amount.parse::<f64>()?;
+	Ok((amount * GRIN_BASE as f64) as u64)
 }
-/// An iterator over hashes in a vector that pairs them to build a row in a
-/// Merkle tree. If the vector has an odd number of hashes, it appends a zero
-/// hash
-/// See https://bitcointalk.org/index.php?topic=102395.0 CVE-2012-2459 (block
-/// merkle calculation exploit)
-/// for the argument against duplication of last hash
-struct HPairIter(Vec<Hash>);
-impl Iterator for HPairIter {
-	type Item = HPair;
 
-	fn next(&mut self) -> Option<HPair> {
-		self.0.pop().map(|first| HPair(first, self.0.pop().unwrap_or(ZERO_HASH)))
-	}
-}
-/// A row in a Merkle tree. Can be built from a vector of hashes. Calculates
-/// the next level up, or can recursively go all the way up to its root.
-struct MerkleRow(Vec<HPair>);
-impl MerkleRow {
-	fn new(hs: Vec<Hash>) -> MerkleRow {
-		MerkleRow(HPairIter(hs).map(|hp| hp).collect())
-	}
-	fn up(&self) -> MerkleRow {
-		MerkleRow::new(map_vec!(self.0, |hp| hp.hash()))
-	}
-	fn root(&self) -> Hash {
-		if self.0.len() == 0 {
-			[].hash()
-		} else if self.0.len() == 1 {
-			self.0[0].hash()
-		} else {
-			self.up().root()
-		}
-	}
+/// Common method for converting an amount to a human-readable string
+
+pub fn amount_to_hr_string(amount: u64) -> String {
+	let amount = (amount as f64 / GRIN_BASE as f64) as f64;
+	let places = (GRIN_BASE as f64).log(10.0) as usize + 1;
+	String::from(format!("{:.*}", places, amount))
 }
 
 #[cfg(test)]
 mod test {
 	use super::*;
+	use core::target::Difficulty;
 	use core::hash::ZERO_HASH;
-	use secp;
-	use secp::Secp256k1;
-	use secp::key::SecretKey;
+	use core::build::{initial_tx, input, output, with_excess, with_fee, with_lock_height};
+	use core::block::Error::KernelLockHeight;
 	use ser;
-	use rand::os::OsRng;
-	use core::build::{self, input, output, input_rand, output_rand, with_fee, initial_tx,
-	                  with_excess};
+	use keychain;
+	use keychain::{BlindingFactor, Keychain};
 
-	fn new_secp() -> Secp256k1 {
-		secp::Secp256k1::with_caps(secp::ContextFlag::Commit)
+	#[test]
+	pub fn test_amount_to_hr() {
+		assert!(50123456789 == amount_from_hr_string("50.123456789").unwrap());
+		assert!(50 == amount_from_hr_string(".000000050").unwrap());
+		assert!(1 == amount_from_hr_string(".000000001").unwrap());
+		assert!(0 == amount_from_hr_string(".0000000009").unwrap());
+		assert!(500_000_000_000 == amount_from_hr_string("500").unwrap());
+		assert!(
+			5_000_000_000_000_000_000 == amount_from_hr_string("5000000000.00000000000").unwrap()
+		);
+	}
+
+	#[test]
+	pub fn test_hr_to_amount() {
+		assert!("50.123456789" == amount_to_hr_string(50123456789));
+		assert!("0.000000050" == amount_to_hr_string(50));
+		assert!("0.000000001" == amount_to_hr_string(1));
+		assert!("500.000000000" == amount_to_hr_string(500_000_000_000));
+		assert!("5000000000.000000000" == amount_to_hr_string(5_000_000_000_000_000_000));
 	}
 
 	#[test]
 	#[should_panic(expected = "InvalidSecretKey")]
-	fn zero_commit() {
-		// a transaction whose commitment sums to zero shouldn't validate
-		let ref secp = new_secp();
-		let mut rng = OsRng::new().unwrap();
+	fn test_zero_commit_fails() {
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
 
 		// blinding should fail as signing with a zero r*G shouldn't work
-		let skey = SecretKey::new(secp, &mut rng);
-		build::transaction(vec![input(10, skey), output(1, skey), with_fee(9)]).unwrap();
+		build::transaction(
+			vec![
+				input(10, key_id1.clone()),
+				output(9, key_id1.clone()),
+				with_fee(1),
+			],
+			&keychain,
+		).unwrap();
 	}
 
 	#[test]
 	fn simple_tx_ser() {
 		let tx = tx2i1o();
 		let mut vec = Vec::new();
-		ser::serialize(&mut vec, &tx).expect("serialized failed");
-		assert!(vec.len() > 5320);
-		assert!(vec.len() < 5340);
+		ser::serialize(&mut vec, &tx).expect("serialization failed");
+		let target_len = 954;
+		assert_eq!(vec.len(), target_len,);
 	}
 
 	#[test]
@@ -274,7 +289,7 @@ mod test {
 		let mut vec = Vec::new();
 		ser::serialize(&mut vec, &tx).expect("serialization failed");
 		let dtx: Transaction = ser::deserialize(&mut &vec[..]).unwrap();
-		assert_eq!(dtx.fee, 1);
+		assert_eq!(dtx.fee(), 2);
 		assert_eq!(dtx.inputs.len(), 2);
 		assert_eq!(dtx.outputs.len(), 1);
 		assert_eq!(tx.hash(), dtx.hash());
@@ -298,26 +313,108 @@ mod test {
 	}
 
 	#[test]
+	fn build_tx_kernel() {
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		// first build a valid tx with corresponding blinding factor
+		let tx = build::transaction(
+			vec![
+				input(10, key_id1),
+				output(5, key_id2),
+				output(3, key_id3),
+				with_fee(2),
+			],
+			&keychain,
+		).unwrap();
+
+		// check the tx is valid
+		tx.validate().unwrap();
+
+		// check the kernel is also itself valid
+		assert_eq!(tx.kernels.len(), 1);
+		let kern = &tx.kernels[0];
+		kern.verify().unwrap();
+
+		assert_eq!(kern.features, KernelFeatures::DEFAULT_KERNEL);
+		assert_eq!(kern.fee, tx.fee());
+	}
+
+	// Combine two transactions into one big transaction (with multiple kernels)
+	// and check it still validates.
+	#[test]
+	fn transaction_cut_through() {
+		let tx1 = tx1i2o();
+		let tx2 = tx2i1o();
+
+		assert!(tx1.validate().is_ok());
+		assert!(tx2.validate().is_ok());
+
+		// now build a "cut_through" tx from tx1 and tx2
+		let mut tx3 = tx1.clone();
+		tx3.inputs.extend(tx2.inputs.iter().cloned());
+		tx3.outputs.extend(tx2.outputs.iter().cloned());
+		tx3.kernels.extend(tx2.kernels.iter().cloned());
+
+		// make sure everything is sorted
+		tx3.inputs.sort();
+		tx3.outputs.sort();
+		tx3.kernels.sort();
+
+		// finally sum the offsets up
+		// TODO - hide this in a convenience function somewhere
+		tx3.offset = {
+			let secp = static_secp_instance();
+			let secp = secp.lock().unwrap();
+			let skey1 = tx1.offset.secret_key(&secp).unwrap();
+			let skey2 = tx2.offset.secret_key(&secp).unwrap();
+			let skey3 = secp.blind_sum(vec![skey1, skey2], vec![]).unwrap();
+			BlindingFactor::from_secret_key(skey3)
+		};
+
+		assert!(tx3.validate().is_ok());
+	}
+
+	#[test]
 	fn hash_output() {
-		let (tx, _) =
-			build::transaction(vec![input_rand(75), output_rand(42), output_rand(32), with_fee(1)])
-				.unwrap();
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		let tx = build::transaction(
+			vec![
+				input(75, key_id1),
+				output(42, key_id2),
+				output(32, key_id3),
+				with_fee(1),
+			],
+			&keychain,
+		).unwrap();
 		let h = tx.outputs[0].hash();
 		assert!(h != ZERO_HASH);
 		let h2 = tx.outputs[1].hash();
 		assert!(h != h2);
 	}
 
+	#[ignore]
 	#[test]
 	fn blind_tx() {
-		let ref secp = new_secp();
-
 		let btx = tx2i1o();
-		btx.verify_sig(&secp).unwrap(); // unwrap will panic if invalid
+		assert!(btx.validate().is_ok());
+
+		// Ignored for bullet proofs, because calling range_proof_info
+		// with a bullet proof causes painful errors
 
 		// checks that the range proof on our blind output is sufficiently hiding
 		let Output { proof, .. } = btx.outputs[0];
+
+		let secp = static_secp_instance();
+		let secp = secp.lock().unwrap();
 		let info = secp.range_proof_info(proof);
+
 		assert!(info.min == 0);
 		assert!(info.max == u64::max_value());
 	}
@@ -336,84 +433,218 @@ mod test {
 	/// 2 inputs, 2 outputs transaction.
 	#[test]
 	fn tx_build_exchange() {
-		let ref secp = new_secp();
+		let keychain = Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+		let key_id4 = keychain.derive_key_id(4).unwrap();
 
-		let tx_alice: Transaction;
-		let blind_sum: SecretKey;
-
-		{
+		let (tx_alice, blind_sum) = {
 			// Alice gets 2 of her pre-existing outputs to send 5 coins to Bob, they
 			// become inputs in the new transaction
-			let (in1, in2) = (input_rand(4), input_rand(3));
+			let (in1, in2) = (input(4, key_id1), input(3, key_id2));
 
 			// Alice builds her transaction, with change, which also produces the sum
 			// of blinding factors before they're obscured.
-			let (tx, sum) = build::transaction(vec![in1, in2, output_rand(1), with_fee(1)])
-				.unwrap();
-			tx_alice = tx;
-			blind_sum = sum;
-		}
+			let (tx, sum) = build::partial_transaction(
+				vec![in1, in2, output(1, key_id3), with_fee(2)],
+				&keychain,
+			).unwrap();
+
+			(tx, sum)
+		};
 
 		// From now on, Bob only has the obscured transaction and the sum of
 		// blinding factors. He adds his output, finalizes the transaction so it's
 		// ready for broadcast.
-		let (tx_final, _) =
-			build::transaction(vec![initial_tx(tx_alice), with_excess(blind_sum), output_rand(5)])
-				.unwrap();
+		let tx_final = build::transaction(
+			vec![
+				initial_tx(tx_alice),
+				with_excess(blind_sum),
+				output(4, key_id4),
+			],
+			&keychain,
+		).unwrap();
 
-		tx_final.validate(&secp).unwrap();
+		tx_final.validate().unwrap();
 	}
 
 	#[test]
 	fn reward_empty_block() {
-		let mut rng = OsRng::new().unwrap();
-		let ref secp = new_secp();
-		let skey = SecretKey::new(secp, &mut rng);
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id = keychain.derive_key_id(1).unwrap();
 
-		let b = Block::new(&BlockHeader::default(), vec![], skey).unwrap();
-		b.compact().validate(&secp).unwrap();
+		let previous_header = BlockHeader::default();
+
+		let b = Block::new(
+			&previous_header,
+			vec![],
+			&keychain,
+			&key_id,
+			Difficulty::one(),
+		).unwrap();
+		b.cut_through().validate(&previous_header).unwrap();
 	}
 
 	#[test]
 	fn reward_with_tx_block() {
-		let mut rng = OsRng::new().unwrap();
-		let ref secp = new_secp();
-		let skey = SecretKey::new(secp, &mut rng);
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id = keychain.derive_key_id(1).unwrap();
 
 		let mut tx1 = tx2i1o();
-		tx1.verify_sig(&secp).unwrap();
+		tx1.validate().unwrap();
 
-		let b = Block::new(&BlockHeader::default(), vec![&mut tx1], skey).unwrap();
-		b.compact().validate(&secp).unwrap();
+		let previous_header = BlockHeader::default();
+
+		let block = Block::new(
+			&previous_header,
+			vec![&mut tx1],
+			&keychain,
+			&key_id,
+			Difficulty::one(),
+		).unwrap();
+		block.cut_through().validate(&previous_header).unwrap();
 	}
 
 	#[test]
 	fn simple_block() {
-		let mut rng = OsRng::new().unwrap();
-		let ref secp = new_secp();
-		let skey = SecretKey::new(secp, &mut rng);
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id = keychain.derive_key_id(1).unwrap();
 
 		let mut tx1 = tx2i1o();
-		tx1.verify_sig(&secp).unwrap();
-
 		let mut tx2 = tx1i1o();
-		tx2.verify_sig(&secp).unwrap();
 
-		let b = Block::new(&BlockHeader::default(), vec![&mut tx1, &mut tx2], skey).unwrap();
-		b.validate(&secp).unwrap();
+		let previous_header = BlockHeader::default();
+
+		let b = Block::new(
+			&previous_header,
+			vec![&mut tx1, &mut tx2],
+			&keychain,
+			&key_id,
+			Difficulty::one(),
+		).unwrap();
+		b.validate(&previous_header).unwrap();
+	}
+
+	#[test]
+	fn test_block_with_timelocked_tx() {
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		// first check we can add a timelocked tx where lock height matches current
+		// block height and that the resulting block is valid
+		let tx1 = build::transaction(
+			vec![
+				input(5, key_id1.clone()),
+				output(3, key_id2.clone()),
+				with_fee(2),
+				with_lock_height(1),
+			],
+			&keychain,
+		).unwrap();
+
+		let previous_header = BlockHeader::default();
+
+		let b = Block::new(
+			&previous_header,
+			vec![&tx1],
+			&keychain,
+			&key_id3.clone(),
+			Difficulty::one(),
+		).unwrap();
+		b.validate(&previous_header).unwrap();
+
+		// now try adding a timelocked tx where lock height is greater than current
+		// block height
+		let tx1 = build::transaction(
+			vec![
+				input(5, key_id1.clone()),
+				output(3, key_id2.clone()),
+				with_fee(2),
+				with_lock_height(2),
+			],
+			&keychain,
+		).unwrap();
+
+		let previous_header = BlockHeader::default();
+
+		let b = Block::new(
+			&previous_header,
+			vec![&tx1],
+			&keychain,
+			&key_id3.clone(),
+			Difficulty::one(),
+		).unwrap();
+		match b.validate(&previous_header) {
+			Err(KernelLockHeight(height)) => {
+				assert_eq!(height, 2);
+			}
+			_ => panic!("expecting KernelLockHeight error here"),
+		}
+	}
+
+	#[test]
+	pub fn test_verify_1i1o_sig() {
+		let tx = tx1i1o();
+		tx.validate().unwrap();
+	}
+
+	#[test]
+	pub fn test_verify_2i1o_sig() {
+		let tx = tx2i1o();
+		tx.validate().unwrap();
 	}
 
 	// utility producing a transaction with 2 inputs and a single outputs
 	pub fn tx2i1o() -> Transaction {
-		build::transaction(vec![input_rand(10), input_rand(11), output_rand(20), with_fee(1)])
-			.map(|(tx, _)| tx)
-			.unwrap()
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		build::transaction_with_offset(
+			vec![
+				input(10, key_id1),
+				input(11, key_id2),
+				output(19, key_id3),
+				with_fee(2),
+			],
+			&keychain,
+		).unwrap()
 	}
 
 	// utility producing a transaction with a single input and output
 	pub fn tx1i1o() -> Transaction {
-		build::transaction(vec![input_rand(5), output_rand(4), with_fee(1)])
-			.map(|(tx, _)| tx)
-			.unwrap()
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+
+		build::transaction_with_offset(
+			vec![input(5, key_id1), output(3, key_id2), with_fee(2)],
+			&keychain,
+		).unwrap()
+	}
+
+	// utility producing a transaction with a single input
+	// and two outputs (one change output)
+	// Note: this tx has an "offset" kernel
+	pub fn tx1i2o() -> Transaction {
+		let keychain = keychain::Keychain::from_random_seed().unwrap();
+		let key_id1 = keychain.derive_key_id(1).unwrap();
+		let key_id2 = keychain.derive_key_id(2).unwrap();
+		let key_id3 = keychain.derive_key_id(3).unwrap();
+
+		build::transaction_with_offset(
+			vec![
+				input(6, key_id1),
+				output(3, key_id2),
+				output(1, key_id3),
+				with_fee(2),
+			],
+			&keychain,
+		).unwrap()
 	}
 }

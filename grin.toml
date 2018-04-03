@@ -9,6 +9,10 @@
 # -[user home]/.grin
 #
 
+#########################################
+### SERVER CONFIGURATION              ###
+#########################################
+
 #Server connection details
 [server]
 
@@ -22,87 +26,243 @@ api_http_addr = "127.0.0.1:13413"
 db_root = ".grin"
 
 #How to seed this server, can be None, List or WebStatic
+#
+#seeding_type = "None"
 
-seeding_type = "None"
+#If seeding_type = List, the list of peers to connect to.
+#
+#seeds = ["192.168.0.1:13414","192.168.0.2:13414"]
 
-#if seeding_type = List, the list of peers to connect to.
-#seeds = ["192.168.0.1:8080","192.168.0.2:8080"]
-
-#The mining parameter mode, which defines the set of cuckoo parameters
-#used for mining. Can be:
+#The chain type, which defines the genesis block and the set of cuckoo
+#parameters used for mining. Can be:
 #AutomatedTesting - For CI builds and instant blockchain creation
-#UserTesting - For regular user testing, much lighter than production more
-#Production - Full production cuckoo parameters
+#UserTesting - For regular user testing (cuckoo 16)
+#Testnet1 - Testnet1 genesis block (cuckoo 16)
+#Testnet2 - Testnet2 genesis block (cuckoo 30)
+#
+chain_type = "Testnet2"
 
-mining_parameter_mode = "UserTesting"
+#The chain validation mode, defines how often (if at all) we
+#want to run a full chain validation. Can be:
+#EveryBlock - run full chain validation when processing each block (except during sync)
+#Disabled - disable full chain validation (just run regular block validation)
+#chain_validation_mode=Disabled
+
+#run the node in "full archive" mode (default is fast-sync, pruned node)
+#archive_mode = false
 
 #7 = Bit flags for FULL_NODE, this structure needs to be changed
 #internally to make it more configurable
-
 capabilities = [7]
-        
+
+#skip waiting for sync on startup, (optional param, mostly for testing)
+#skip_sync_wait = false
+
+#whether to run the ncurses TUI. Ncurses must be installed and this
+#will also disable logging to stdout
+run_tui = true
+
+#Whether to run the wallet listener with the server by default
+run_wallet_listener = true
+
 #The P2P server details (i.e. the server that communicates with other
 #grin server nodes
 
 [server.p2p_config]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 13414
-        
-#Mining details. This section is optional. If it's not here, the server 
-#will default to not mining. 
+
+#hardcoded peer lists for allow/deny
+#will *only* connect to peers in allow list
+#peers_allow = ["192.168.0.1:13414", "192.168.0.2:13414"]
+#will *never* connect to peers in deny list
+#peers_deny = ["192.168.0.3:13414", "192.168.0.4:13414"]
+
+#dandelion relay time
+#dandelion_relay_time = 600
+
+#how long a banned peer should stay banned
+#ban_window = 10800
+
+#maximum number of peers
+#peer_max_count = 25
+
+#preferred minimum number of peers (we'll actively keep trying to add peers
+#until we get to at least this number
+#peer_min_preferred_count = 8
+
+#########################################
+### WALLET CONFIGURATION              ###
+#########################################
+
+[wallet]
+
+# Host IP for wallet listener, change to "0.0.0.0" to receive grins
+api_listen_interface = "127.0.0.1"
+
+# Port for wallet listener
+api_listen_port = 13415
+
+# Where the wallet should find a running node
+check_node_api_http_addr = "http://localhost:13413"
+
+# Where to find wallet files (seed, data, etc)
+data_file_dir = "."
+
+#########################################
+### LOGGING CONFIGURATION             ###
+#########################################
+
+[logging]
+
+# Whether to log to stdout
+log_to_stdout = true
+
+# Log level for stdout: Critical, Error, Warning, Info, Debug, Trace
+stdout_log_level = "Warning"
+
+# Whether to log to a file
+log_to_file = true
+
+# Log level for file: Critical, Error, Warning, Info, Debug, Trace
+file_log_level = "Debug"
+
+# Log file path
+log_file_path = "grin.log"
+
+# Whether to append to the log file (true), or replace it on every run (false)
+log_file_append = true
+
+#########################################
+### MINING CONFIGURATION              ###
+#########################################
+
+#Mining details. This section is optional. If it's not here, the server
+#will default to not mining.
 [mining]
 
 #flag whether mining is enabled
 
 enable_mining = true
 
-#Whether to use cuckoo-miner,  and related parameters
-
-use_cuckoo_miner = true
-
-#Whether to use async mode for cuckoo miner, if the plugin supports it.
+#Whether to use async mode for the miner, if the plugin supports it.
 #this allows for many searches to be run in parallel, e.g. if the system
-#has multiple GPUs. This creates overhead, especially on faster test miners,
-#so in a post-release world this should only be used if you really want
-#to run cards in parallel
+#has multiple GPUs, or if you want to mine using multiple plugins
 
-cuckoo_miner_async_mode = false
+miner_async_mode = false
 
-#If using cuckoo_miner, the directory in which plugins are installed
+#The directory in which mining plugins are installed
 #if not specified, grin will look in the directory /deps relative
 #to the executable
 
-#cuckoo_miner_plugin_dir = "target/debug/deps"
-
-#if using cuckoo_miner, the implementation to use.. currently
-#just filters for this word in the filenames in the plugin 
-#directory
-#Plugins currently included are:
-#"simple" : the basic cuckoo algorithm
-#"edgetrim" : an algorithm trading speed for a much lower memory footprint
-#"tomato" : Time memory-tradeoff... low memory but very slow
-#Not included but verified working:
-#"cuda" a gpu miner - which currently needs to bebuilt and installed 
-#separately from#the cuckoo-miner repository. Instructions found there
-
-cuckoo_miner_plugin_type = "simple"
-
-#the list of parameters if you're using "edgetrim"
-#cuckoo_miner_parameter_list = {NUM_THREADS=4, NUM_TRIMS=7}
+#miner_plugin_dir = "target/debug/plugins"
 
 #The amount of time, in seconds, to attempt to mine on a particular
 #header before stopping and re-collecting transactions from the pool
 
-attempt_time_per_block = 30
+attempt_time_per_block = 90
 
 #the wallet reciever to which coinbase rewards will be sent
 
-wallet_receiver_url = "http://127.0.0.1:13415"
+wallet_listener_url = "http://127.0.0.1:13415"
 
 #whether to ignore the reward (mostly for testing)
 
-burn_reward = true
+burn_reward = false
 
 #testing value, optional
 #slow_down_in_millis = 30
 
+
+#########################################
+### CUCKOO MINER PLUGIN CONFIGURATION ###
+#########################################
+
+# These entries configure instances of cuckoo miner
+# plugins if the 'use_cuckoo_miner' value above is
+# set to 'true'.
+#
+# Multiple plugins can be specified, (e.g. a cpu
+# miner and a gpu miner running in parallel). However,
+# if 'use_async_mode' above is set to 'false', only
+# the first plugin specified will be used for mining
+# in single-threaded mode
+
+# You'll likely get the best performance using a
+# single GPU plugin and single CPU plugin in parallel
+
+# Parameters can be set per-device. On CPU plugins
+# you'll likely only be using device 0 (for now),
+# but in CUDA plugins the device number corresponds
+# to the device ID. (use nvidia-smi to find this)
+
+#The fastest cpu algorithm, but consumes the most memory
+#Also requires instructions that aren't available on
+#older processors. In this case, use mean_compat_cpu
+#instead
+#[[mining.miner_plugin_config]]
+#type_filter = "mean_cpu"
+#[mining.miner_plugin_config.device_parameters.0]
+#NUM_THREADS = 1
+
+#As above, but for older processors
+[[mining.miner_plugin_config]]
+type_filter = "mean_compat_cpu"
+[mining.miner_plugin_config.device_parameters.0]
+NUM_THREADS = 1
+
+#note lean_cpu currently has a bug which prevents it from
+#working with threads > 1
+
+#[[mining.miner_plugin_config]]
+#type_filter = "lean_cpu"
+#[mining.miner_plugin_config.device_parameters.0]
+#NUM_THREADS = 1
+
+#CUDA Miner
+#
+# Note! 4+ GB GPU cards only!
+#   If you have 6GB GPU RAM, set N_BLOCKS = 128
+#   Docs: https://github.com/tromp/cuckoo/blob/master/GPU.md
+#
+#Can currently be used only in Production (30) Mode
+#This plugin is not built by default. To build:
+#1) Ensure the latest cuda toolkit is installed
+#   (nvcc should be in your PATH)
+#   Wrong gcc? install gcc-5 g++-5; export CC=`which gcc-5`; # then build
+#2) Uncomment the 'build-cuda-plugin' feature
+#   in pow/Cargo.toml
+#
+#Parameters can be set per device, as below. In sync mode
+#device 0 is currently the only device used. In async mode
+#device 0 is used by default, and all other devices are
+#disabled unless explicitly enabled by setting the 'USE_DEVICE'
+#param to 1 on each device, as demonstrated below.
+
+#[[mining.miner_plugin_config]]
+#type_filter = "cuda"
+#[mining.miner_plugin_config.device_parameters.0]
+#USE_DEVICE = 1
+
+# Below are advanced optional per-device tweakable params
+
+#N_TRIMS = 256
+#N_BLOCKS = 128
+#GENU_BLOCKS = 128
+#GENU_TPB = 8
+#GENV_STAGE1_TPB = 32
+#GENV_STAGE2_TPB = 128
+#TRIM_STAGE1_TPB = 32
+#TRIM_STAGE2_TPB = 128
+#RENAME_0_STAGE1_TPB = 32
+#RENAME_0_STAGE2_TPB = 64
+#RENAME_1_STAGE1_TPB = 32
+#RENAME_1_STAGE2_TPB = 128
+#TRIM_3_TPB = 32
+#RENAME_3_TPB = 8
+
+#[mining.miner_plugin_config.device_parameters.1]
+#USE_DEVICE = 1
+
+#[mining.miner_plugin_config.device_parameters.2]
+#USE_DEVICE = 1

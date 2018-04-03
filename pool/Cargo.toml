@@ -1,15 +1,18 @@
 [package]
 name = "grin_pool"
-version = "0.1.0"
-authors = ["Grin Authors <mimblewimble@lists.launchpad.net>"]
+version = "0.2.0"
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+workspace = '..'
+publish = false
 
 [dependencies]
-grin_core = { path = "../core" }
-grin_store = { path = "../store" }
-grin_p2p = { path = "../p2p" }
-secp256k1zkp = { path = "../secp256k1zkp" }
-time = "^0.1"
+blake2-rfc = "0.2"
 rand = "0.3"
-log = "0.3"
+serde = "1"
+serde_derive = "1"
+slog = { version = "~2.1", features = ["max_level_trace", "release_max_level_trace"] }
+time = "0.1"
 
-[dev-dependencies]
+grin_core = { path = "../core" }
+grin_keychain = { path = "../keychain" }
+grin_util = { path = "../util" }

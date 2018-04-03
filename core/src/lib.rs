@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,16 +25,19 @@
 extern crate bitflags;
 extern crate blake2_rfc as blake2;
 extern crate byteorder;
-extern crate crypto;
+extern crate grin_keychain as keychain;
+extern crate grin_util as util;
+#[macro_use]
+extern crate lazy_static;
 extern crate num_bigint as bigint;
 extern crate rand;
-extern crate secp256k1zkp as secp;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate time;
+extern crate siphasher;
 #[macro_use]
-extern crate lazy_static;
+extern crate slog;
+extern crate time;
 
 #[macro_use]
 pub mod macros;

@@ -1,4 +1,4 @@
-// Copyright 2017 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,12 +26,18 @@ mod types;
 mod blockchain;
 mod pool;
 
-extern crate time;
-extern crate rand;
-extern crate log;
-
+extern crate blake2_rfc as blake2;
 extern crate grin_core as core;
-extern crate secp256k1zkp as secp;
+extern crate grin_keychain as keychain;
+extern crate grin_util as util;
+extern crate rand;
+extern crate serde;
+#[allow(unused_imports)]
+#[macro_use] // Needed for Serialize/Deserialize. The compiler complaining here is a bug.
+extern crate serde_derive;
+#[macro_use]
+extern crate slog;
+extern crate time;
 
 pub use pool::TransactionPool;
-pub use types::{BlockChain, TxSource, PoolError};
+pub use types::{BlockChain, PoolAdapter, PoolConfig, PoolError, TxSource};

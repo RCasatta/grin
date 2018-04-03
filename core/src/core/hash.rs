@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,10 +20,14 @@
 use std::cmp::min;
 use std::{fmt, ops};
 use std::convert::AsRef;
+use std::ops::Add;
+use byteorder::{BigEndian, ByteOrder};
 
 use blake2::blake2b::Blake2b;
 
-use ser::{self, Reader, Readable, Writer, Writeable, Error, AsFixedBytes};
+use consensus;
+use ser::{self, AsFixedBytes, Error, Readable, Reader, Writeable, Writer};
+use util;
 
 /// A hash consisting of all zeroes, used as a sentinel. No known preimage.
 pub const ZERO_HASH: Hash = Hash([0; 32]);
@@ -62,6 +66,22 @@ impl Hash {
 	/// Converts the hash to a byte vector
 	pub fn to_vec(&self) -> Vec<u8> {
 		self.0.to_vec()
+	}
+
+	/// Convert a hash to hex string format.
+	pub fn to_hex(&self) -> String {
+		util::to_hex(self.to_vec())
+	}
+
+	/// Convert hex string back to hash.
+	pub fn from_hex(hex: &str) -> Result<Hash, Error> {
+		let bytes = util::from_hex(hex.to_string()).unwrap();
+		Ok(Hash::from_vec(bytes))
+	}
+
+	/// Most significant 64 bits
+	pub fn to_u64(&self) -> u64 {
+		BigEndian::read_u64(&self.0)
 	}
 }
 
@@ -128,6 +148,19 @@ impl Writeable for Hash {
 	}
 }
 
+impl Add for Hash {
+	type Output = Hash;
+	fn add(self, other: Hash) -> Hash {
+		self.hash_with(other)
+	}
+}
+
+impl Default for Hash {
+	fn default() -> Hash {
+		ZERO_HASH
+	}
+}
+
 /// Serializer that outputs a hash of the serialized object
 pub struct HashWriter {
 	state: Blake2b,
@@ -143,15 +176,17 @@ impl HashWriter {
 	/// Consume the `HashWriter`, outputting a `Hash` corresponding to its
 	/// current state
 	pub fn into_hash(self) -> Hash {
-    let mut res = [0; 32];
+		let mut res = [0; 32];
 		(&mut res).copy_from_slice(self.state.finalize().as_bytes());
-    Hash(res)
+		Hash(res)
 	}
 }
 
 impl Default for HashWriter {
 	fn default() -> HashWriter {
-		HashWriter { state: Blake2b::new(32) }
+		HashWriter {
+			state: Blake2b::new(32),
+		}
 	}
 }
 
@@ -170,6 +205,8 @@ impl ser::Writer for HashWriter {
 pub trait Hashed {
 	/// Obtain the hash of the object
 	fn hash(&self) -> Hash;
+	/// Hash the object together with another writeable object
+	fn hash_with<T: Writeable>(&self, other: T) -> Hash;
 }
 
 impl<W: ser::Writeable> Hashed for W {
@@ -180,14 +217,27 @@ impl<W: ser::Writeable> Hashed for W {
 		hasher.finalize(&mut ret);
 		Hash(ret)
 	}
-}
 
-// Convenience for when we need to hash of an empty array.
-impl Hashed for [u8; 0] {
-	fn hash(&self) -> Hash {
-		let hasher = HashWriter::default();
+	fn hash_with<T: Writeable>(&self, other: T) -> Hash {
+		let mut hasher = HashWriter::default();
+		ser::Writeable::write(self, &mut hasher).unwrap();
+		ser::Writeable::write(&other, &mut hasher).unwrap();
 		let mut ret = [0; 32];
 		hasher.finalize(&mut ret);
 		Hash(ret)
+	}
+}
+
+impl<T: Writeable> consensus::VerifySortOrder<T> for Vec<T> {
+	fn verify_sort_order(&self) -> Result<(), consensus::Error> {
+		match self.iter()
+			.map(|item| item.hash())
+			.collect::<Vec<_>>()
+			.windows(2)
+			.any(|pair| pair[0] > pair[1])
+		{
+			true => Err(consensus::Error::SortError),
+			false => Ok(()),
+		}
 	}
 }

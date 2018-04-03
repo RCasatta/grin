@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,229 +12,368 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Synchronization of the local blockchain with the rest of the network. Used
-//! either on a brand new node or when a node is late based on others' heads.
-//! Always starts by downloading the header chain before asking either for full
-//! blocks or a full UTXO set with related information.
+use std::{cmp, thread};
+use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use time;
 
-/// How many block bodies to download in parallel
-const MAX_BODY_DOWNLOADS: usize = 8;
-
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Instant, Duration};
-
-use core::core::hash::{Hash, Hashed};
 use chain;
-use p2p;
+use core::core::hash::{Hash, Hashed};
+use core::core::target::Difficulty;
+use core::global;
+use p2p::{self, Peer, Peers};
 use types::Error;
+use util::LOGGER;
 
-pub struct Syncer {
+/// Starts the syncing loop, just spawns two threads that loop forever
+pub fn run_sync(
+	currently_syncing: Arc<AtomicBool>,
+	awaiting_peers: Arc<AtomicBool>,
+	peers: Arc<p2p::Peers>,
 	chain: Arc<chain::Chain>,
-	p2p: Arc<p2p::Server>,
+	skip_sync_wait: bool,
+	archive_mode: bool,
+	stop: Arc<AtomicBool>,
+) {
+	let chain = chain.clone();
+	let _ = thread::Builder::new()
+		.name("sync".to_string())
+		.spawn(move || {
+			let mut prev_body_sync = time::now_utc();
+			let mut prev_header_sync = prev_body_sync.clone();
+			let mut prev_fast_sync = prev_body_sync.clone() - time::Duration::seconds(5 * 60);
+			let mut highest_height = 0;
 
-	sync: Mutex<bool>,
-	last_header_req: Mutex<Instant>,
-	blocks_to_download: Mutex<Vec<Hash>>,
-	blocks_downloading: Mutex<Vec<(Hash, Instant)>>,
+			// initial sleep to give us time to peer with some nodes
+			if !skip_sync_wait {
+				awaiting_peers.store(true, Ordering::Relaxed);
+				thread::sleep(Duration::from_secs(30));
+				awaiting_peers.store(false, Ordering::Relaxed);
+			}
+
+			// fast sync has 3 states:
+			// * syncing headers
+			// * once all headers are sync'd, requesting the txhashset state
+			// * once we have the state, get blocks after that
+			//
+			// full sync gets rid of the middle step and just starts from
+			// the genesis state
+
+			loop {
+				let horizon = global::cut_through_horizon() as u64;
+				let head = chain.head().unwrap();
+				let header_head = chain.get_header_head().unwrap();
+
+				// is syncing generally needed when we compare our state with others
+				let (syncing, most_work_height) =
+					needs_syncing(currently_syncing.as_ref(), peers.clone(), chain.clone());
+
+				if most_work_height > 0 {
+					// we can occasionally get a most work height of 0 if read locks fail
+					highest_height = most_work_height;
+				}
+
+				// in archival nodes (no fast sync) we just consider we have the whole
+				// state already, then fast sync triggers if other peers are much
+				// further ahead
+				let fast_sync_enabled =
+					!archive_mode && highest_height.saturating_sub(head.height) > horizon;
+
+				let current_time = time::now_utc();
+				if syncing {
+					// run the header sync every 10s
+					if current_time - prev_header_sync > time::Duration::seconds(10) {
+						header_sync(peers.clone(), chain.clone());
+						prev_header_sync = current_time;
+					}
+
+					// run the body_sync every 5s
+					if !fast_sync_enabled
+						&& current_time - prev_body_sync > time::Duration::seconds(5)
+					{
+						body_sync(peers.clone(), chain.clone());
+						prev_body_sync = current_time;
+					}
+
+					// run fast sync if applicable, every 5 min
+					if fast_sync_enabled && header_head.height == highest_height {
+						if current_time - prev_fast_sync > time::Duration::seconds(5 * 60) {
+							fast_sync(peers.clone(), chain.clone(), &header_head);
+							prev_fast_sync = current_time;
+						}
+					}
+				}
+				currently_syncing.store(syncing, Ordering::Relaxed);
+
+				thread::sleep(Duration::from_secs(1));
+
+				if stop.load(Ordering::Relaxed) {
+					break;
+				}
+			}
+		});
 }
 
-impl Syncer {
-	pub fn new(chain_ref: Arc<chain::Chain>, p2p: Arc<p2p::Server>) -> Syncer {
-		Syncer {
-			chain: chain_ref,
-			p2p: p2p,
-			sync: Mutex::new(true),
-			last_header_req: Mutex::new(Instant::now() - Duration::from_secs(2)),
-			blocks_to_download: Mutex::new(vec![]),
-			blocks_downloading: Mutex::new(vec![]),
-		}
-	}
+fn body_sync(peers: Arc<Peers>, chain: Arc<chain::Chain>) {
+	let body_head: chain::Tip = chain.head().unwrap();
+	let header_head: chain::Tip = chain.get_header_head().unwrap();
+	let sync_head: chain::Tip = chain.get_sync_head().unwrap();
 
-	pub fn syncing(&self) -> bool {
-		*self.sync.lock().unwrap()
-	}
+	debug!(
+		LOGGER,
+		"body_sync: body_head - {}, {}, header_head - {}, {}, sync_head - {}, {}",
+		body_head.last_block_h,
+		body_head.height,
+		header_head.last_block_h,
+		header_head.height,
+		sync_head.last_block_h,
+		sync_head.height,
+	);
 
-	/// Checks the local chain state, comparing it with our peers and triggers
-	/// syncing if required.
-	pub fn run(&self) -> Result<(), Error> {
-		debug!("Starting syncer.");
-		let start = Instant::now();
-		loop {
-			let pc = self.p2p.peer_count();
-			if pc > 3 {
+	let mut hashes = vec![];
+
+	if header_head.total_difficulty > body_head.total_difficulty {
+		let mut current = chain.get_block_header(&header_head.last_block_h);
+		while let Ok(header) = current {
+			// break out of the while loop when we find a header common
+			// between the this chain and the current chain
+			if let Ok(_) = chain.is_on_current_chain(&header) {
 				break;
 			}
-			if pc > 0 && (Instant::now() - start > Duration::from_secs(10)) {
-				break;
-			}
-			thread::sleep(Duration::from_millis(200));
+
+			hashes.push(header.hash());
+			current = chain.get_block_header(&header.previous);
 		}
+	}
+	hashes.reverse();
 
-		// check if we have missing full blocks for which we already have a header
-		self.init_download()?;
+	// if we have 5 peers to sync from then ask for 50 blocks total (peer_count *
+	// 10) max will be 80 if all 8 peers are advertising more work
+	let peer_count = cmp::min(peers.more_work_peers().len(), 10);
+	let block_count = peer_count * 10;
 
-		// main syncing loop, requests more headers and bodies periodically as long
-		// as a peer with higher difficulty exists and we're not fully caught up
-		info!("Starting sync loop.");
-		loop {
-			let tip = self.chain.get_header_head()?;
-			// TODO do something better (like trying to get more) if we lose peers
-			let peer = self.p2p.most_work_peer().unwrap();
+	let hashes_to_get = hashes
+		.iter()
+		.filter(|x| {
+			// only ask for blocks that we have not yet processed
+			// either successfully stored or in our orphan list
+			!chain.get_block(x).is_ok() && !chain.is_orphan(x)
+		})
+		.take(block_count)
+		.cloned()
+		.collect::<Vec<_>>();
 
-			let more_headers = peer.info.total_difficulty > tip.total_difficulty;
-			let more_bodies = {
-				let blocks_to_download = self.blocks_to_download.lock().unwrap();
-				let blocks_downloading = self.blocks_downloading.lock().unwrap();
-				blocks_to_download.len() > 0 || blocks_downloading.len() > 0
-			};
+	if hashes_to_get.len() > 0 {
+		debug!(
+			LOGGER,
+			"block_sync: {}/{} requesting blocks {:?} from {} peers",
+			body_head.height,
+			header_head.height,
+			hashes_to_get,
+			peer_count,
+		);
 
-			{
-				let last_header_req = self.last_header_req.lock().unwrap().clone();
-				if more_headers && (Instant::now() - Duration::from_secs(2) > last_header_req) {
-					self.request_headers()?;
+		for hash in hashes_to_get.clone() {
+			// TODO - Is there a threshold where we sync from most_work_peer (not
+			// more_work_peer)?
+			let peer = peers.more_work_peer();
+			if let Some(peer) = peer {
+				if let Ok(peer) = peer.try_read() {
+					if let Err(e) = peer.send_block_request(hash) {
+						debug!(LOGGER, "Skipped request to {}: {:?}", peer.info.addr, e);
+					}
 				}
 			}
-			if more_bodies {
-				self.request_bodies();
-			}
-			if !more_headers && !more_bodies {
-				// TODO check we haven't been lied to on the total work
-				let mut sync = self.sync.lock().unwrap();
-				*sync = false;
-				break;
-			}
-
-			thread::sleep(Duration::from_secs(2));
 		}
-		info!("Sync done.");
-		Ok(())
 	}
+}
 
-	/// Checks the gap between the header chain and the full block chain and
-	/// initializes the blocks_to_download structure with the missing full
-	/// blocks
-	fn init_download(&self) -> Result<(), Error> {
-		// compare the header's head to the full one to see what we're missing
-		let header_head = self.chain.get_header_head()?;
-		let full_head = self.chain.head()?;
-		let mut blocks_to_download = self.blocks_to_download.lock().unwrap();
+fn header_sync(peers: Arc<Peers>, chain: Arc<chain::Chain>) {
+	if let Ok(header_head) = chain.get_header_head() {
+		let difficulty = header_head.total_difficulty;
 
-		// go back the chain and insert for download all blocks we only have the
-		// head for
-		let mut prev_h = header_head.last_block_h;
-		while prev_h != full_head.last_block_h {
-			let header = self.chain.get_block_header(&prev_h)?;
-			blocks_to_download.push(header.hash());
-			prev_h = header.previous;
-		}
-
-		debug!("Added {} full block hashes to download.",
-		       blocks_to_download.len());
-		Ok(())
-	}
-
-	/// Asks for the blocks we haven't downloaded yet and place them in the
-	/// downloading structure.
-	fn request_bodies(&self) {
-		let mut blocks_downloading = self.blocks_downloading.lock().unwrap();
-		if blocks_downloading.len() > MAX_BODY_DOWNLOADS {
-			// clean up potentially dead downloads
-			let twenty_sec_ago = Instant::now() - Duration::from_secs(20);
-			blocks_downloading.iter()
-				.position(|&h| h.1 < twenty_sec_ago)
-				.map(|n| blocks_downloading.remove(n));
-		} else {
-			// consume hashes from blocks to download, place them in downloading and
-			// request them from the network
-			let mut blocks_to_download = self.blocks_to_download.lock().unwrap();
-			while blocks_to_download.len() > 0 && blocks_downloading.len() < MAX_BODY_DOWNLOADS {
-				let h = blocks_to_download.pop().unwrap();
-				let peer = self.p2p.random_peer().unwrap();
-				let send_result = peer.send_block_request(h);
-				match send_result {
-					Ok(_) => {}
-					Err(_) => {}
+		if let Some(peer) = peers.most_work_peer() {
+			if let Ok(p) = peer.try_read() {
+				let peer_difficulty = p.info.total_difficulty.clone();
+				if peer_difficulty > difficulty {
+					let _ = request_headers(peer.clone(), chain.clone());
 				}
-				blocks_downloading.push((h, Instant::now()));
 			}
-			debug!("Requesting more full block hashes to download, total: {}.",
-			       blocks_to_download.len());
 		}
 	}
+}
 
-	/// We added a block, clean up the downloading structure
-	pub fn block_received(&self, bh: Hash) {
-		// just clean up the downloading list
-		let mut bds = self.blocks_downloading.lock().unwrap();
-		bds.iter().position(|&h| h.0 == bh).map(|n| bds.remove(n));
-	}
+fn fast_sync(peers: Arc<Peers>, chain: Arc<chain::Chain>, header_head: &chain::Tip) {
+	let horizon = global::cut_through_horizon() as u64;
 
-	/// Request some block headers from a peer to advance us
-	fn request_headers(&self) -> Result<(), Error> {
-		{
-			let mut last_header_req = self.last_header_req.lock().unwrap();
-			*last_header_req = Instant::now();
+	if let Some(peer) = peers.most_work_peer() {
+		if let Ok(p) = peer.try_read() {
+			debug!(
+				LOGGER,
+				"Header head before txhashset request: {} / {}",
+				header_head.height,
+				header_head.last_block_h
+			);
+
+			// ask for txhashset at horizon
+			let mut txhashset_head = chain.get_block_header(&header_head.prev_block_h).unwrap();
+			for _ in 0..horizon.saturating_sub(20) {
+				txhashset_head = chain.get_block_header(&txhashset_head.previous).unwrap();
+			}
+			p.send_txhashset_request(txhashset_head.height, txhashset_head.hash())
+				.unwrap();
 		}
+	}
+}
 
-		let tip = self.chain.get_header_head()?;
-		let peer = self.p2p.most_work_peer();
-		let locator = self.get_locator(&tip)?;
-		if let Some(p) = peer {
-			debug!("Asking peer {} for more block headers starting from {} at {}.",
-			       p.info.addr,
-			       tip.last_block_h,
-			       tip.height);
-			p.send_header_request(locator)?;
+/// Request some block headers from a peer to advance us.
+fn request_headers(peer: Arc<RwLock<Peer>>, chain: Arc<chain::Chain>) -> Result<(), Error> {
+	let locator = get_locator(chain)?;
+	if let Ok(peer) = peer.try_read() {
+		debug!(
+			LOGGER,
+			"sync: request_headers: asking {} for headers, {:?}", peer.info.addr, locator,
+		);
+		let _ = peer.send_header_request(locator);
+	} else {
+		// not much we can do here, log and try again next time
+		debug!(
+			LOGGER,
+			"sync: request_headers: failed to get read lock on peer",
+		);
+	}
+	Ok(())
+}
+
+/// Whether we're currently syncing the chain or we're fully caught up and
+/// just receiving blocks through gossip.
+fn needs_syncing(
+	currently_syncing: &AtomicBool,
+	peers: Arc<Peers>,
+	chain: Arc<chain::Chain>,
+) -> (bool, u64) {
+	let local_diff = chain.total_difficulty();
+	let peer = peers.most_work_peer();
+	let is_syncing = currently_syncing.load(Ordering::Relaxed);
+	let mut most_work_height = 0;
+
+	// if we're already syncing, we're caught up if no peer has a higher
+	// difficulty than us
+	if is_syncing {
+		if let Some(peer) = peer {
+			if let Ok(peer) = peer.try_read() {
+				debug!(
+					LOGGER,
+					"needs_syncing {} {}", local_diff, peer.info.total_difficulty
+				);
+				most_work_height = peer.info.height;
+
+				if peer.info.total_difficulty <= local_diff {
+					let ch = chain.head().unwrap();
+					info!(
+						LOGGER,
+						"synchronised at {} @ {} [{}]",
+						local_diff.into_num(),
+						ch.height,
+						ch.last_block_h
+					);
+
+					let _ = chain.reset_head();
+					return (false, 0);
+				}
+			}
 		} else {
-			warn!("Could not get most worked peer to request headers.");
+			warn!(LOGGER, "sync: no peers available, disabling sync");
+			return (false, 0);
 		}
-		Ok(())
-	}
+	} else {
+		if let Some(peer) = peer {
+			if let Ok(peer) = peer.try_read() {
+				most_work_height = peer.info.height;
 
-	/// We added a header, add it to the full block download list
-	pub fn headers_received(&self, bhs: Vec<Hash>) {
-		let mut blocks_to_download = self.blocks_to_download.lock().unwrap();
-		let hs_len = bhs.len();
-		for h in bhs {
-			// enlist for full block download
-			blocks_to_download.insert(0, h);
-		}
-		// ask for more headers if we got as many as required
-		if hs_len == (p2p::MAX_BLOCK_HEADERS as usize) {
-			self.request_headers().unwrap();
-		}
-	}
+				// sum the last 5 difficulties to give us the threshold
+				let threshold = chain
+					.difficulty_iter()
+					.filter_map(|x| x.map(|(_, x)| x).ok())
+					.take(5)
+					.fold(Difficulty::zero(), |sum, val| sum + val);
 
-	/// Builds a vector of block hashes that should help the remote peer sending
-	/// us the right block headers.
-	fn get_locator(&self, tip: &chain::Tip) -> Result<Vec<Hash>, Error> {
-		// Prepare the heights we want as the latests height minus increasing powers
-		// of 2 up to max.
-		let mut heights = vec![tip.height];
-		let mut tail = (1..p2p::MAX_LOCATORS)
-			.map(|n| 2u64.pow(n))
-			.filter_map(|n| if n > tip.height {
-				None
-			} else {
-				Some(tip.height - n)
-			})
-			.collect::<Vec<_>>();
-		heights.append(&mut tail);
-
-		// Iteratively travel the header chain back from our head and retain the
-		// headers at the wanted heights.
-		let mut header = self.chain.get_block_header(&tip.last_block_h)?;
-		let mut locator = vec![];
-		while heights.len() > 0 {
-			if header.height == heights[0] {
-				heights = heights[1..].to_vec();
-				locator.push(header.hash());
-			}
-			if header.height > 0 {
-				header = self.chain.get_block_header(&header.previous)?;
+				if peer.info.total_difficulty > local_diff.clone() + threshold.clone() {
+					info!(
+						LOGGER,
+						"sync: total_difficulty {}, peer_difficulty {}, threshold {} (last 5 blocks), enabling sync",
+						local_diff,
+						peer.info.total_difficulty,
+						threshold,
+					);
+					return (true, most_work_height);
+				}
 			}
 		}
-		Ok(locator)
+	}
+	(is_syncing, most_work_height)
+}
+
+/// We build a locator based on sync_head.
+/// Even if sync_head is significantly out of date we will "reset" it once we start getting
+/// headers back from a peer.
+fn get_locator(chain: Arc<chain::Chain>) -> Result<Vec<Hash>, Error> {
+	let tip = chain.get_sync_head()?;
+	let heights = get_locator_heights(tip.height);
+
+	debug!(LOGGER, "sync: locator heights: {:?}", heights);
+
+	let mut locator = vec![];
+	let mut current = chain.get_block_header(&tip.last_block_h);
+	while let Ok(header) = current {
+		if heights.contains(&header.height) {
+			locator.push(header.hash());
+		}
+		current = chain.get_block_header(&header.previous);
+	}
+
+	debug!(LOGGER, "sync: locator: {:?}", locator);
+
+	Ok(locator)
+}
+
+// current height back to 0 decreasing in powers of 2
+fn get_locator_heights(height: u64) -> Vec<u64> {
+	let mut current = height.clone();
+	let mut heights = vec![];
+	while current > 0 {
+		heights.push(current);
+		let next = 2u64.pow(heights.len() as u32);
+		current = if current > next { current - next } else { 0 }
+	}
+	heights.push(0);
+	heights
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn test_get_locator_heights() {
+		assert_eq!(get_locator_heights(0), vec![0]);
+		assert_eq!(get_locator_heights(1), vec![1, 0]);
+		assert_eq!(get_locator_heights(2), vec![2, 0]);
+		assert_eq!(get_locator_heights(3), vec![3, 1, 0]);
+		assert_eq!(get_locator_heights(10), vec![10, 8, 4, 0]);
+		assert_eq!(get_locator_heights(100), vec![100, 98, 94, 86, 70, 38, 0]);
+		assert_eq!(
+			get_locator_heights(1000),
+			vec![1000, 998, 994, 986, 970, 938, 874, 746, 490, 0]
+		);
+		// check the locator is still a manageable length, even for large numbers of
+		// headers
+		assert_eq!(
+			get_locator_heights(10000),
+			vec![
+				10000, 9998, 9994, 9986, 9970, 9938, 9874, 9746, 9490, 8978, 7954, 5906, 1810, 0
+			]
+		);
 	}
 }

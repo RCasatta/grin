@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,20 +29,22 @@
 #![warn(missing_docs)]
 
 extern crate blake2_rfc as blake2;
-extern crate rand;
-extern crate time;
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate log;
-extern crate env_logger;
+extern crate rand;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate slog;
+extern crate time;
 
 extern crate grin_core as core;
+extern crate grin_util as util;
 
-extern crate cuckoo_miner;
+// Re-export (mostly for stat collection)
+pub extern crate cuckoo_miner as cuckoo_;
+pub use cuckoo_ as cuckoo_miner;
 
 mod siphash;
 pub mod plugin;
@@ -51,7 +53,6 @@ pub mod types;
 
 use core::consensus;
 use core::core::BlockHeader;
-use core::core::hash::Hashed;
 use core::core::Proof;
 use core::core::target::Difficulty;
 use core::global;
@@ -62,89 +63,81 @@ use cuckoo::{Cuckoo, Error};
 ///
 
 pub trait MiningWorker {
-
 	/// This only sets parameters and does initialisation work now
-	fn new(ease: u32, sizeshift: u32, proof_size:usize) -> Self where Self:Sized;
+	fn new(ease: u32, sizeshift: u32, proof_size: usize) -> Self
+	where
+		Self: Sized;
 
 	/// Actually perform a mining attempt on the given input and
 	/// return a proof if found
 	fn mine(&mut self, header: &[u8]) -> Result<Proof, Error>;
-
 }
 
 /// Validates the proof of work of a given header, and that the proof of work
 /// satisfies the requirements of the header.
 pub fn verify_size(bh: &BlockHeader, cuckoo_sz: u32) -> bool {
-	// make sure the pow hash shows a difficulty at least as large as the target
-	// difficulty
-	if bh.difficulty > bh.pow.clone().to_difficulty() {
-		return false;
+	Cuckoo::new(&bh.pre_pow_hash()[..], cuckoo_sz)
+		.verify(bh.pow.clone(), consensus::EASINESS as u64)
+}
+
+/// Mines a genesis block, using the config specified miner if specified.
+/// Otherwise, uses the internal miner
+pub fn mine_genesis_block(
+	miner_config: Option<types::MinerConfig>,
+) -> Result<core::core::Block, Error> {
+	let mut gen = genesis::genesis_testnet2();
+	if global::is_user_testing_mode() || global::is_automated_testing_mode() {
+		gen = genesis::genesis_dev();
+		gen.header.timestamp = time::now();
 	}
-	Cuckoo::new(&bh.hash()[..], cuckoo_sz).verify(bh.pow.clone(), consensus::EASINESS as u64)
-}
 
-/// Uses the much easier Cuckoo20 (mostly for
-/// tests).
-pub fn pow20<T: MiningWorker>(miner:&mut T, bh: &mut BlockHeader, diff: Difficulty) -> Result<(), Error> {
-	pow_size(miner, bh, diff, 20)
-}
+	// total_difficulty on the genesis header *is* the difficulty of that block
+	let genesis_difficulty = gen.header.total_difficulty.clone();
 
-/// Mines a genesis block, using the config specified miner if specified. Otherwise,
-/// uses the internal miner
-///
-
-pub fn mine_genesis_block(miner_config:Option<types::MinerConfig>)->Option<core::core::Block> {
-	info!("Starting miner loop for Genesis Block");
-	let mut gen = genesis::genesis();
-	let diff = gen.header.difficulty.clone();
-			
 	let sz = global::sizeshift() as u32;
 	let proof_size = global::proofsize();
 
-	let mut miner:Box<MiningWorker> = match miner_config {
-		Some(c) => {
-			if c.use_cuckoo_miner  {
-				let mut p = plugin::PluginMiner::new(consensus::EASINESS, sz, proof_size);
-				p.init(c.clone());
-				Box::new(p)
-
-			} else {
-				Box::new(cuckoo::Miner::new(consensus::EASINESS, sz, proof_size))
-			}		
+	let mut miner: Box<MiningWorker> = match miner_config {
+		Some(c) => if c.enable_mining {
+			let mut p = plugin::PluginMiner::new(consensus::EASINESS, sz, proof_size);
+			p.init(c.clone());
+			Box::new(p)
+		} else {
+			Box::new(cuckoo::Miner::new(consensus::EASINESS, sz, proof_size))
 		},
 		None => Box::new(cuckoo::Miner::new(consensus::EASINESS, sz, proof_size)),
 	};
-	pow_size(&mut *miner, &mut gen.header, diff, sz as u32).unwrap();
-	Some(gen)
+	pow_size(&mut *miner, &mut gen.header, genesis_difficulty, sz as u32).unwrap();
+	Ok(gen)
 }
 
-/// Runs a proof of work computation over the provided block using the provided Mining Worker,
-/// until the required difficulty target is reached. May take a while for a low target...
-pub fn pow_size<T: MiningWorker + ?Sized>(miner:&mut T, bh: &mut BlockHeader,
-								 diff: Difficulty, _: u32) -> Result<(), Error> {
+/// Runs a proof of work computation over the provided block using the provided
+/// Mining Worker, until the required difficulty target is reached. May take a
+/// while for a low target...
+pub fn pow_size<T: MiningWorker + ?Sized>(
+	miner: &mut T,
+	bh: &mut BlockHeader,
+	diff: Difficulty,
+	_: u32,
+) -> Result<(), Error> {
 	let start_nonce = bh.nonce;
 
-	// if we're in production mode, try the pre-mined solution first
-	if global::is_production_mode() {
-		let p = Proof::new(global::get_genesis_pow().to_vec());
-		if p.clone().to_difficulty() >= diff {
-			bh.pow = p;
-			return Ok(());
-		}
+	// set the nonce for faster solution finding in user testing
+	if bh.height == 0 && global::is_user_testing_mode() {
+		bh.nonce = global::get_genesis_nonce();
 	}
 
 	// try to find a cuckoo cycle on that header hash
 	loop {
 		// can be trivially optimized by avoiding re-serialization every time but this
 		// is not meant as a fast miner implementation
-		let pow_hash = bh.hash();
+		let pow_hash = bh.pre_pow_hash();
 
 		// if we found a cycle (not guaranteed) and the proof hash is higher that the
 		// diff, we're all good
-
 		if let Ok(proof) = miner.mine(&pow_hash[..]) {
 			if proof.clone().to_difficulty() >= diff {
-				bh.pow = proof;
+				bh.pow = proof.clone();
 				return Ok(());
 			}
 		}
@@ -166,19 +159,26 @@ mod test {
 	use global;
 	use core::core::target::Difficulty;
 	use core::genesis;
-  	use core::consensus::MINIMUM_DIFFICULTY;
-	use core::global::MiningParameterMode;
-
+	use core::global::ChainTypes;
 
 	#[test]
 	fn genesis_pow() {
-        global::set_mining_mode(MiningParameterMode::AutomatedTesting);
-		let mut b = genesis::genesis();
-		b.header.nonce = 310;
-		let mut internal_miner = cuckoo::Miner::new(consensus::EASINESS, global::sizeshift() as u32, global::proofsize());
-		pow_size(&mut internal_miner, &mut b.header, Difficulty::from_num(MINIMUM_DIFFICULTY), global::sizeshift() as u32).unwrap();
+		global::set_mining_mode(ChainTypes::AutomatedTesting);
+		let mut b = genesis::genesis_dev();
+		b.header.nonce = 485;
+		let mut internal_miner = cuckoo::Miner::new(
+			consensus::EASINESS,
+			global::sizeshift() as u32,
+			global::proofsize(),
+		);
+		pow_size(
+			&mut internal_miner,
+			&mut b.header,
+			Difficulty::one(),
+			global::sizeshift() as u32,
+		).unwrap();
 		assert!(b.header.nonce != 310);
-		assert!(b.header.pow.clone().to_difficulty() >= Difficulty::from_num(MINIMUM_DIFFICULTY));
+		assert!(b.header.pow.clone().to_difficulty() >= Difficulty::one());
 		assert!(verify_size(&b.header, global::sizeshift() as u32));
 	}
 }

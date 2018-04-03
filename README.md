@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/ignopeverell/grin.svg?branch=master)](https://travis-ci.org/ignopeverell/grin) [![Gitter chat](https://badges.gitter.im/grin_community/Lobby.png)](https://gitter.im/grin_community/Lobby)
+[![Build Status](https://travis-ci.org/mimblewimble/grin.svg?branch=master)](https://travis-ci.org/mimblewimble/grin) [![Gitter chat](https://badges.gitter.im/grin_community/Lobby.png)](https://gitter.im/grin_community/Lobby) [![Codecov coverage status](https://codecov.io/gh/mimblewimble/grin/branch/master/graph/badge.svg)](https://codecov.io/gh/mimblewimble/grin)
 
 # Grin
 
@@ -6,23 +6,21 @@ Grin is an in-progress implementation of the MimbleWimble protocol. Many charact
 
   * Clean and minimal implementation, aiming to stay as such.
   * Follows the MimbleWimble protocol, which provides great anonymity and scaling characteristics.
-  * Cuckoo Cycle proof of work (at least to start with).
-  * Relatively fast block time (a minute or less, possibly decreasing as networks improve).
-  * Fixed block reward, both over time and in blocks (fees are not additive).
-  * Transaction fees are based on the number of UTXO created/destroyed and total transaction size.
+  * Cuckoo Cycle proof of work.
+  * Relatively fast block time (a minute).
+  * Fixed block reward over time with a decreasing dilution.
+  * Transaction fees are based on the number of Outputs created/destroyed and total transaction size.
   * Smooth curve for difficulty adjustments.
 
 To learn more, read our [introduction to MimbleWimble and Grin](doc/intro.md).
 
 ## Status
 
-Grin is still an infant, much is left to be done and contributions are welcome (see below). Check our [mailing list archives](https://lists.launchpad.net/mimblewimble/) for the latest status.
+Grin is still an infant, much is left to be done and [contributions](CONTRIBUTING.md) are welcome (see below). Check our [mailing list archives](https://lists.launchpad.net/mimblewimble/) for the latest status.
 
 ## Contributing
 
-Find an area you can help with and do it. Open source is about collaboration and open participation. Try to make your code look like what already exists and submit a pull request. If you're looking for additional ideas, the code includes TODO comments for minor to major improvements. Grep is your friend.
-
-Additional tests are rewarded with an immense amount of positive karma. So is documentation.
+To get involved, read our [contributing docs](CONTRIBUTING.md).
 
 Find us:
 

@@ -1,5 +1,4 @@
-// Copyright 2016 The Grin Developers
-//
+// Copyright 2018 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,11 +19,30 @@
 //! here.
 
 use std::fmt;
+use std::cmp::max;
 
 use core::target::Difficulty;
+use global;
 
-/// The block subsidy amount
-pub const REWARD: u64 = 1_000_000_000;
+/// A grin is divisible to 10^9, following the SI prefixes
+pub const GRIN_BASE: u64 = 1_000_000_000;
+/// Milligrin, a thousand of a grin
+pub const MILLI_GRIN: u64 = GRIN_BASE / 1_000;
+/// Microgrin, a thousand of a milligrin
+pub const MICRO_GRIN: u64 = MILLI_GRIN / 1_000;
+/// Nanogrin, smallest unit, takes a billion to make a grin
+pub const NANO_GRIN: u64 = 1;
+
+/// The block subsidy amount, one grin per second on average
+pub const REWARD: u64 = 60 * GRIN_BASE;
+
+/// Actual block reward for a given total fee amount
+pub fn reward(fee: u64) -> u64 {
+	REWARD + fee
+}
+
+/// Number of blocks before a coinbase matures and can be spent
+pub const COINBASE_MATURITY: u64 = 1_000;
 
 /// Block interval, in seconds, the network will tune its next_target for. Note
 /// that we may reduce this value in the future as we get more data on mining
@@ -54,23 +72,94 @@ pub const CUT_THROUGH_HORIZON: u32 = 48 * 3600 / (BLOCK_TIME_SEC as u32);
 /// peer-to-peer networking layer only for DoS protection.
 pub const MAX_MSG_LEN: u64 = 20_000_000;
 
-/// The minimum mining difficulty we'll allow
-pub const MINIMUM_DIFFICULTY: u64 = 10;
+/// Weight of an input when counted against the max block weigth capacity
+pub const BLOCK_INPUT_WEIGHT: usize = 1;
+
+/// Weight of an output when counted against the max block weight capacity
+pub const BLOCK_OUTPUT_WEIGHT: usize = 10;
+
+/// Weight of a kernel when counted against the max block weight capacity
+pub const BLOCK_KERNEL_WEIGHT: usize = 2;
+
+/// Total maximum block weight
+pub const MAX_BLOCK_WEIGHT: usize = 80_000;
+
+/// Maximum inputs for a block (issue#261)
+/// Hundreds of inputs + 1 output might be slow to validate (issue#258)
+pub const MAX_BLOCK_INPUTS: usize = 300_000; // soft fork down when too_high
+
+/// Maximum inputs for a transaction
+pub const MAX_TX_INPUTS: u64 = 2048;
+
+/// Maximum outputs for a transaction
+pub const MAX_TX_OUTPUTS: u64 = 500; // wallet uses 500 as max
+
+/// Maximum kernels for a transaction
+pub const MAX_TX_KERNELS: u64 = 2048;
+
+/// Whether a block exceeds the maximum acceptable weight
+pub fn exceeds_weight(input_len: usize, output_len: usize, kernel_len: usize) -> bool {
+	input_len * BLOCK_INPUT_WEIGHT + output_len * BLOCK_OUTPUT_WEIGHT
+		+ kernel_len * BLOCK_KERNEL_WEIGHT > MAX_BLOCK_WEIGHT || input_len > MAX_BLOCK_INPUTS
+}
+
+/// Fork every 250,000 blocks for first 2 years, simple number and just a
+/// little less than 6 months.
+pub const HARD_FORK_INTERVAL: u64 = 250_000;
+
+/// Check whether the block version is valid at a given height, implements
+/// 6 months interval scheduled hard forks for the first 2 years.
+pub fn valid_header_version(height: u64, version: u16) -> bool {
+	// uncomment below as we go from hard fork to hard fork
+	if height <= HARD_FORK_INTERVAL && version == 1 {
+		true
+	/* } else if height <= 2 * HARD_FORK_INTERVAL && version == 2 {
+		true */
+	/* } else if height <= 3 * HARD_FORK_INTERVAL && version == 3 {
+		true */
+	/* } else if height <= 4 * HARD_FORK_INTERVAL && version == 4 {
+		true */
+	/* } else if height > 4 * HARD_FORK_INTERVAL && version > 4 {
+		true */
+	} else {
+		false
+	}
+}
 
 /// Time window in blocks to calculate block time median
 pub const MEDIAN_TIME_WINDOW: u64 = 11;
 
+/// Index at half the desired median
+pub const MEDIAN_TIME_INDEX: u64 = MEDIAN_TIME_WINDOW / 2;
+
 /// Number of blocks used to calculate difficulty adjustments
-pub const DIFFICULTY_ADJUST_WINDOW: u64 = 23;
+pub const DIFFICULTY_ADJUST_WINDOW: u64 = 60;
 
 /// Average time span of the difficulty adjustment window
 pub const BLOCK_TIME_WINDOW: u64 = DIFFICULTY_ADJUST_WINDOW * BLOCK_TIME_SEC;
 
-/// Maximum size time window used for difficutly adjustments
-pub const UPPER_TIME_BOUND: u64 = BLOCK_TIME_WINDOW * 4 / 3;
+/// Maximum size time window used for difficulty adjustments
+pub const UPPER_TIME_BOUND: u64 = BLOCK_TIME_WINDOW * 2;
 
-/// Minimum size time window used for difficutly adjustments
-pub const LOWER_TIME_BOUND: u64 = BLOCK_TIME_WINDOW * 5 / 6;
+/// Minimum size time window used for difficulty adjustments
+pub const LOWER_TIME_BOUND: u64 = BLOCK_TIME_WINDOW / 2;
+
+/// Dampening factor to use for difficulty adjustment
+pub const DAMP_FACTOR: u64 = 3;
+
+/// The initial difficulty at launch. This should be over-estimated
+/// and difficulty should come down at launch rather than up
+/// Currently grossly over-estimated at 10% of current
+/// ethereum GPUs (assuming 1GPU can solve a block at diff 1
+/// in one block interval)
+pub const INITIAL_DIFFICULTY: u64 = 1_000_000;
+
+/// Consensus errors
+#[derive(Clone, Debug, PartialEq)]
+pub enum Error {
+	/// Inputs/outputs/kernels must be sorted lexicographically.
+	SortError,
+}
 
 /// Error when computing the next difficulty adjustment.
 #[derive(Debug, Clone)]
@@ -90,56 +179,56 @@ impl fmt::Display for TargetError {
 /// The difficulty calculation is based on both Digishield and GravityWave
 /// family of difficulty computation, coming to something very close to Zcash.
 /// The refence difficulty is an average of the difficulty over a window of
-/// 23 blocks. The corresponding timespan is calculated by using the
-/// difference between the median timestamps at the beginning and the end
-/// of the window.
+/// DIFFICULTY_ADJUST_WINDOW blocks. The corresponding timespan is calculated
+/// by using the difference between the median timestamps at the beginning
+/// and the end of the window.
 pub fn next_difficulty<T>(cursor: T) -> Result<Difficulty, TargetError>
-	where T: IntoIterator<Item = Result<(u64, Difficulty), TargetError>>
+where
+	T: IntoIterator<Item = Result<(u64, Difficulty), TargetError>>,
 {
+	// Create vector of difficulty data running from earliest
+	// to latest, and pad with simulated pre-genesis data to allow earlier
+	// adjustment if there isn't enough window data
+	// length will be DIFFICULTY_ADJUST_WINDOW+MEDIAN_TIME_WINDOW
+	let diff_data = global::difficulty_data_to_vector(cursor);
 
-	// Block times at the begining and end of the adjustment window, used to
-	// calculate medians later.
-	let mut window_begin = vec![];
-	let mut window_end = vec![];
+	// Obtain the median window for the earlier time period
+	// the first MEDIAN_TIME_WINDOW elements
+	let mut window_earliest: Vec<u64> = diff_data
+		.iter()
+		.take(MEDIAN_TIME_WINDOW as usize)
+		.map(|n| n.clone().unwrap().0)
+		.collect();
+	// pick median
+	window_earliest.sort();
+	let earliest_ts = window_earliest[MEDIAN_TIME_INDEX as usize];
 
-	// Sum of difficulties in the window, used to calculate the average later.
-	let mut diff_sum = Difficulty::zero();
+	// Obtain the median window for the latest time period
+	// i.e. the last  MEDIAN_TIME_WINDOW elements
+	let mut window_latest: Vec<u64> = diff_data
+		.iter()
+		.skip(DIFFICULTY_ADJUST_WINDOW as usize)
+		.map(|n| n.clone().unwrap().0)
+		.collect();
+	// pick median
+	window_latest.sort();
+	let latest_ts = window_latest[MEDIAN_TIME_INDEX as usize];
 
-	// Enumerating backward over blocks
-	for (n, head_info) in cursor.into_iter().enumerate() {
-		let m = n as u64;
-		let (ts, diff) = head_info?;
+	// median time delta
+	let ts_delta = latest_ts - earliest_ts;
 
-		// Sum each element in the adjustment window. In addition, retain
-		// timestamps within median windows (at ]start;start-11] and ]end;end-11]
-		// to later calculate medians.
-		if m < DIFFICULTY_ADJUST_WINDOW {
-			diff_sum = diff_sum + diff;
+	// Get the difficulty sum of the last DIFFICULTY_ADJUST_WINDOW elements
+	let diff_sum = diff_data
+		.iter()
+		.skip(MEDIAN_TIME_WINDOW as usize)
+		.fold(0, |sum, d| sum + d.clone().unwrap().1.into_num());
 
-			if m < MEDIAN_TIME_WINDOW {
-				window_begin.push(ts);
-			}
-		} else if m < DIFFICULTY_ADJUST_WINDOW + MEDIAN_TIME_WINDOW {
-			window_end.push(ts);
-		} else {
-			break;
-		}
-	}
-
-	// Check we have enough blocks
-	if window_end.len() < (MEDIAN_TIME_WINDOW as usize) {
-		return Ok(Difficulty::from_num(MINIMUM_DIFFICULTY));
-	}
-
-	// Calculating time medians at the beginning and end of the window.
-	window_begin.sort();
-	window_end.sort();
-	let begin_ts = window_begin[window_begin.len() / 2];
-	let end_ts = window_end[window_end.len() / 2];
-
-	// Average difficulty and dampened average time
-	let diff_avg = diff_sum.clone() / Difficulty::from_num(DIFFICULTY_ADJUST_WINDOW);
-	let ts_damp = (3 * BLOCK_TIME_WINDOW + (begin_ts - end_ts)) / 4;
+	// Apply dampening except when difficulty is near 1
+	let ts_damp = if diff_sum < DAMP_FACTOR * DIFFICULTY_ADJUST_WINDOW {
+		ts_delta
+	} else {
+		(1 * ts_delta + (DAMP_FACTOR-1) * BLOCK_TIME_WINDOW) / DAMP_FACTOR
+	};
 
 	// Apply time bounds
 	let adj_ts = if ts_damp < LOWER_TIME_BOUND {
@@ -150,91 +239,16 @@ pub fn next_difficulty<T>(cursor: T) -> Result<Difficulty, TargetError>
 		ts_damp
 	};
 
-	Ok(diff_avg * Difficulty::from_num(BLOCK_TIME_WINDOW) /
-	   Difficulty::from_num(adj_ts))
+	// AVOID BREAKING CONSENSUS FOR NOW WITH OLD DOUBLE TRUNCATION CALC
+	let difficulty = (diff_sum / DIFFICULTY_ADJUST_WINDOW) * BLOCK_TIME_WINDOW / adj_ts;
+	// EVENTUALLY BREAK CONSENSUS WITH THIS IMPROVED SINGLE TRUNCATION DIFF CALC
+	// let difficulty = diff_sum * BLOCK_TIME_SEC / adj_ts;
+
+	Ok(Difficulty::from_num(max(difficulty, 1)))
 }
 
-#[cfg(test)]
-use std;
-
-#[cfg(test)]
-mod test {
-	use core::target::Difficulty;
-
-	use super::*;
-
-	// Builds an iterator for next difficulty calculation with the provided
-	// constant time interval, difficulty and total length.
-	fn repeat(interval: u64, diff: u64, len: u64) -> Vec<Result<(u64, Difficulty), TargetError>> {
-		//watch overflow here, length shouldn't be ridiculous anyhow
-		assert!(len < std::usize::MAX as u64);
-		let diffs = vec![Difficulty::from_num(diff); len as usize];
-		let times = (0..(len as usize)).map(|n| n * interval as usize).rev();
-		let pairs = times.zip(diffs.iter());
-		pairs.map(|(t, d)| Ok((t as u64, d.clone()))).collect::<Vec<_>>()
-	}
-
-	fn repeat_offs(from: u64,
-	               interval: u64,
-	               diff: u64,
-	               len: u64)
-	               -> Vec<Result<(u64, Difficulty), TargetError>> {
-		map_vec!(repeat(interval, diff, len), |e| {
-			match e.clone() {
-				Err(e) => Err(e),
-				Ok((t, d)) => Ok((t + from, d)),
-			}
-		})
-	}
-
-	/// Checks different next_target adjustments and difficulty boundaries
-	#[test]
-	fn next_target_adjustment() {
-		// not enough data
-		assert_eq!(next_difficulty(vec![]).unwrap(), Difficulty::from_num(MINIMUM_DIFFICULTY));
-		
-		assert_eq!(next_difficulty(vec![Ok((60, Difficulty::one()))]).unwrap(),
-		           Difficulty::from_num(MINIMUM_DIFFICULTY));
-				   
-		assert_eq!(next_difficulty(repeat(60, 10, DIFFICULTY_ADJUST_WINDOW)).unwrap(),
-		           Difficulty::from_num(MINIMUM_DIFFICULTY));
-
-		// just enough data, right interval, should stay constant
-		
-		let just_enough = DIFFICULTY_ADJUST_WINDOW + MEDIAN_TIME_WINDOW;
-		assert_eq!(next_difficulty(repeat(60, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(1000));
-
-		// checking averaging works, window length is odd so need to compensate a little
-		let sec = DIFFICULTY_ADJUST_WINDOW / 2 + 1 + MEDIAN_TIME_WINDOW;
-		let mut s1 = repeat(60, 500, sec);
-		let mut s2 = repeat_offs((sec * 60) as u64, 60, 1545, DIFFICULTY_ADJUST_WINDOW / 2);
-		s2.append(&mut s1);
-		assert_eq!(next_difficulty(s2).unwrap(), Difficulty::from_num(999));
-
-		// too slow, diff goes down
-		assert_eq!(next_difficulty(repeat(90, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(889));
-		assert_eq!(next_difficulty(repeat(120, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(800));
-
-		// too fast, diff goes up
-		assert_eq!(next_difficulty(repeat(55, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(1021));
-		assert_eq!(next_difficulty(repeat(45, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(1067));
-
-		// hitting lower time bound, should always get the same result below
-		assert_eq!(next_difficulty(repeat(20, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(1200));
-		assert_eq!(next_difficulty(repeat(10, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(1200));
-
-		// hitting higher time bound, should always get the same result above
-		assert_eq!(next_difficulty(repeat(160, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(750));
-		assert_eq!(next_difficulty(repeat(200, 1000, just_enough)).unwrap(),
-		           Difficulty::from_num(750));
-	}
-
+/// Consensus rule that collections of items are sorted lexicographically.
+pub trait VerifySortOrder<T> {
+	/// Verify a collection of items is sorted as required.
+	fn verify_sort_order(&self) -> Result<(), Error>;
 }

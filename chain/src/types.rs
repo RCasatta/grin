@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2018 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,28 +14,44 @@
 
 //! Base types that the block chain pipeline requires.
 
-use secp;
-use secp::pedersen::Commitment;
+use std::io;
+
+use util::secp;
+use util::secp::pedersen::Commitment;
 
 use grin_store as store;
-use core::core::{Block, BlockHeader, Output};
+use core::core::{block, transaction, Block, BlockHeader};
 use core::core::hash::{Hash, Hashed};
 use core::core::target::Difficulty;
-use core::ser;
+use core::ser::{self, Readable, Reader, Writeable, Writer};
+use keychain;
 use grin_store;
+use grin_store::pmmr::PMMRFileMetadata;
 
 bitflags! {
-  /// Options for block validation
-  pub flags Options: u32 {
-    /// None flag
-    const NONE = 0b00000001,
-    /// Runs without checking the Proof of Work, mostly to make testing easier.
-    const SKIP_POW = 0b00000010,
-    /// Runs PoW verification with a lower cycle size.
-    const EASY_POW = 0b00000100,
-    /// Adds block while in syncing mode.
-    const SYNC = 0b00001000,
-  }
+/// Options for block validation
+	pub struct Options: u32 {
+		/// No flags
+		const NONE = 0b00000000;
+		/// Runs without checking the Proof of Work, mostly to make testing easier.
+		const SKIP_POW = 0b00000001;
+		/// Adds block while in syncing mode.
+		const SYNC = 0b00000010;
+		/// Block validation on a block we mined ourselves
+		const MINE = 0b00000100;
+	}
+}
+
+/// A helper to hold the roots of the txhashset in order to keep them
+/// readable
+#[derive(Debug)]
+pub struct TxHashSetRoots {
+	/// Output root
+	pub output_root: Hash,
+	/// Range Proof root
+	pub rproof_root: Hash,
+	/// Kernel root
+	pub kernel_root: Hash,
 }
 
 /// Errors
@@ -52,29 +68,97 @@ pub enum Error {
 	/// The proof of work is invalid
 	InvalidPow,
 	/// The block doesn't sum correctly or a tx signature is invalid
-	InvalidBlockProof(secp::Error),
+	InvalidBlockProof(block::Error),
 	/// Block time is too old
 	InvalidBlockTime,
 	/// Block height is invalid (not previous + 1)
 	InvalidBlockHeight,
+	/// One of the root hashes in the block is invalid
+	InvalidRoot,
+	/// Something does not look right with the switch commitment
+	InvalidSwitchCommit,
+	/// Error from underlying keychain impl
+	Keychain(keychain::Error),
+	/// Error from underlying secp lib
+	Secp(secp::Error),
+	/// One of the inputs in the block has already been spent
+	AlreadySpent(Commitment),
+	/// An output with that commitment already exists (should be unique)
+	DuplicateCommitment(Commitment),
+	/// output not found
+	OutputNotFound,
+	/// output spent
+	OutputSpent,
+	/// Invalid block version, either a mistake or outdated software
+	InvalidBlockVersion(u16),
+	/// We've been provided a bad txhashset
+	InvalidTxHashSet(String),
 	/// Internal issue when trying to save or load data from store
-	StoreErr(grin_store::Error),
+	StoreErr(grin_store::Error, String),
+	/// Internal issue when trying to save or load data from append only files
+	FileReadErr(String),
 	/// Error serializing or deserializing a type
 	SerErr(ser::Error),
+	/// Error with the txhashset
+	TxHashSetErr(String),
 	/// No chain exists and genesis block is required
 	GenesisBlockRequired,
+	/// Error from underlying tx handling
+	Transaction(transaction::Error),
 	/// Anything else
 	Other(String),
 }
 
 impl From<grin_store::Error> for Error {
 	fn from(e: grin_store::Error) -> Error {
-		Error::StoreErr(e)
+		Error::StoreErr(e, "wrapped".to_owned())
 	}
 }
+
 impl From<ser::Error> for Error {
 	fn from(e: ser::Error) -> Error {
 		Error::SerErr(e)
+	}
+}
+
+impl From<io::Error> for Error {
+	fn from(e: io::Error) -> Error {
+		Error::TxHashSetErr(e.to_string())
+	}
+}
+
+impl From<keychain::Error> for Error {
+	fn from(e: keychain::Error) -> Error {
+		Error::Keychain(e)
+	}
+}
+
+impl From<secp::Error> for Error {
+	fn from(e: secp::Error) -> Error {
+		Error::Secp(e)
+	}
+}
+
+impl Error {
+	/// Whether the error is due to a block that was intrinsically wrong
+	pub fn is_bad_data(&self) -> bool {
+		// shorter to match on all the "not the block's fault" errors
+		match *self {
+			Error::Unfit(_)
+			| Error::Orphan
+			| Error::StoreErr(_, _)
+			| Error::SerErr(_)
+			| Error::TxHashSetErr(_)
+			| Error::GenesisBlockRequired
+			| Error::Other(_) => false,
+			_ => true,
+		}
+	}
+}
+
+impl From<transaction::Error> for Error {
+	fn from(e: transaction::Error) -> Error {
+		Error::Transaction(e)
 	}
 }
 
@@ -160,14 +244,18 @@ pub trait ChainStore: Send + Sync {
 	/// Gets a block header by hash
 	fn get_block(&self, h: &Hash) -> Result<Block, store::Error>;
 
+	/// Check whether we have a block without reading it
+	fn block_exists(&self, h: &Hash) -> Result<bool, store::Error>;
+
 	/// Gets a block header by hash
 	fn get_block_header(&self, h: &Hash) -> Result<BlockHeader, store::Error>;
 
-	/// Checks whether a block has been been processed and saved
-	fn check_block_exists(&self, h: &Hash) -> Result<bool, store::Error>;
-
 	/// Save the provided block in store
 	fn save_block(&self, b: &Block) -> Result<(), store::Error>;
+
+	/// Delete a full block. Does not delete any record associated with a block
+	/// header.
+	fn delete_block(&self, bh: &Hash) -> Result<(), store::Error>;
 
 	/// Save the provided block header in store
 	fn save_block_header(&self, bh: &BlockHeader) -> Result<(), store::Error>;
@@ -178,20 +266,128 @@ pub trait ChainStore: Send + Sync {
 	/// Save the provided tip as the current head of the block header chain
 	fn save_header_head(&self, t: &Tip) -> Result<(), store::Error>;
 
+	/// Get the tip of the current sync header chain
+	fn get_sync_head(&self) -> Result<Tip, store::Error>;
+
+	/// Save the provided tip as the current head of the sync header chain
+	fn save_sync_head(&self, t: &Tip) -> Result<(), store::Error>;
+
+	/// Reset header_head and sync_head to head of current body chain
+	fn reset_head(&self) -> Result<(), store::Error>;
+
 	/// Gets the block header at the provided height
 	fn get_header_by_height(&self, height: u64) -> Result<BlockHeader, store::Error>;
 
-	/// Gets an output by its commitment
-	fn get_output_by_commit(&self, commit: &Commitment) -> Result<Output, store::Error>;
+	/// Save a header as associated with its height
+	fn save_header_height(&self, header: &BlockHeader) -> Result<(), store::Error>;
 
-	/// Checks whether an output commitment exists and returns the output hash
-	fn has_output_commit(&self, commit: &Commitment) -> Result<Hash, store::Error>;
+	/// Delete the block header at the height
+	fn delete_header_by_height(&self, height: u64) -> Result<(), store::Error>;
+
+	/// Is the block header on the current chain?
+	/// Use the header_by_height index to verify the block header is where we think it is.
+	fn is_on_current_chain(&self, header: &BlockHeader) -> Result<(), store::Error>;
+
+	/// Saves the position of an output, represented by its commitment, in the
+	/// Output MMR. Used as an index for spending and pruning.
+	fn save_output_pos(&self, commit: &Commitment, pos: u64) -> Result<(), store::Error>;
+
+	/// Gets the position of an output, represented by its commitment, in the
+	/// Output MMR. Used as an index for spending and pruning.
+	fn get_output_pos(&self, commit: &Commitment) -> Result<u64, store::Error>;
+
+	/// Deletes the MMR position of an output.
+	fn delete_output_pos(&self, commit: &[u8]) -> Result<(), store::Error>;
+
+	/// Saves a marker associated with a block recording the MMR positions of its
+	/// last elements.
+	fn save_block_marker(&self, bh: &Hash, marker: &(u64, u64)) -> Result<(), store::Error>;
+
+	/// Retrieves a block marker from a block hash.
+	fn get_block_marker(&self, bh: &Hash) -> Result<(u64, u64), store::Error>;
+
+	/// Deletes a block marker associated with the provided hash
+	fn delete_block_marker(&self, bh: &Hash) -> Result<(), store::Error>;
+
+	/// Saves information about the last written PMMR file positions for each
+	/// committed block
+	fn save_block_pmmr_file_metadata(
+		&self,
+		h: &Hash,
+		md: &PMMRFileMetadataCollection,
+	) -> Result<(), store::Error>;
+
+	/// Retrieves stored pmmr file metadata information for a given block
+	fn get_block_pmmr_file_metadata(
+		&self,
+		h: &Hash,
+	) -> Result<PMMRFileMetadataCollection, store::Error>;
+
+	/// Delete stored pmmr file metadata information for a given block
+	fn delete_block_pmmr_file_metadata(&self, h: &Hash) -> Result<(), store::Error>;
 
 	/// Saves the provided block header at the corresponding height. Also check
 	/// the consistency of the height chain in store by assuring previous
-	/// headers
-	/// are also at their respective heights.
-	fn setup_height(&self, bh: &BlockHeader) -> Result<(), store::Error>;
+	/// headers are also at their respective heights.
+	fn setup_height(&self, bh: &BlockHeader, old_tip: &Tip) -> Result<(), store::Error>;
+
+	/// Similar to setup_height but without handling fork
+	fn build_by_height_index(&self, header: &BlockHeader, force: bool) -> Result<(), store::Error>;
+}
+
+/// Single serializable struct to hold metadata about all PMMR file position
+/// for a given block
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PMMRFileMetadataCollection {
+	/// file metadata for the output file
+	pub output_file_md: PMMRFileMetadata,
+	/// file metadata for the rangeproof file
+	pub rproof_file_md: PMMRFileMetadata,
+	/// file metadata for the kernel file
+	pub kernel_file_md: PMMRFileMetadata,
+}
+
+impl Writeable for PMMRFileMetadataCollection {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
+		self.output_file_md.write(writer)?;
+		self.rproof_file_md.write(writer)?;
+		self.kernel_file_md.write(writer)?;
+		Ok(())
+	}
+}
+
+impl Readable for PMMRFileMetadataCollection {
+	fn read(reader: &mut Reader) -> Result<PMMRFileMetadataCollection, ser::Error> {
+		Ok(PMMRFileMetadataCollection {
+			output_file_md: PMMRFileMetadata::read(reader)?,
+			rproof_file_md: PMMRFileMetadata::read(reader)?,
+			kernel_file_md: PMMRFileMetadata::read(reader)?,
+		})
+	}
+}
+
+impl PMMRFileMetadataCollection {
+	/// Return empty with all file positions = 0
+	pub fn empty() -> PMMRFileMetadataCollection {
+		PMMRFileMetadataCollection {
+			output_file_md: PMMRFileMetadata::empty(),
+			rproof_file_md: PMMRFileMetadata::empty(),
+			kernel_file_md: PMMRFileMetadata::empty(),
+		}
+	}
+
+	/// Helper to create a new collection
+	pub fn new(
+		output_md: PMMRFileMetadata,
+		rproof_md: PMMRFileMetadata,
+		kernel_md: PMMRFileMetadata,
+	) -> PMMRFileMetadataCollection {
+		PMMRFileMetadataCollection {
+			output_file_md: output_md,
+			rproof_file_md: rproof_md,
+			kernel_file_md: kernel_md,
+		}
+	}
 }
 
 /// Bridge between the chain pipeline and the rest of the system. Handles
@@ -200,11 +396,11 @@ pub trait ChainStore: Send + Sync {
 pub trait ChainAdapter {
 	/// The blockchain pipeline has accepted this block as valid and added
 	/// it to our chain.
-	fn block_accepted(&self, b: &Block);
+	fn block_accepted(&self, b: &Block, opts: Options);
 }
 
 /// Dummy adapter used as a placeholder for real implementations
 pub struct NoopAdapter {}
 impl ChainAdapter for NoopAdapter {
-	fn block_accepted(&self, _: &Block) {}
+	fn block_accepted(&self, _: &Block, _: Options) {}
 }
